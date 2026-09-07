@@ -4,13 +4,10 @@ import abc
 import copy
 import math
 import gym
-import deepmind_lab
-from dm_control import suite
 
 import numpy as np
 
 from garage.envs import GymEnv, TaskNameWrapper, TaskOnehotWrapper, DeepmindLabEnv
-from garage.envs.dm_control import DMControlEnv, dmc_task_name
 from garage.sampler.env_update import (ExistingEnvUpdate, NewEnvUpdate,
                                        SetTaskUpdate)
 
@@ -448,7 +445,9 @@ class CLTaskSampler(TaskSampler):
             'ALE/YarsRevenge-v5',                                                                                                       # 60
         ]
 
-        self.DM_CONTROL_ENV_SEQS = list(suite.ALL_TASKS)
+        if self._env_type == 'dm_control':
+            from dm_control import suite
+            self.DM_CONTROL_ENV_SEQS = list(suite.ALL_TASKS)
         
 
     @property
@@ -542,6 +541,7 @@ class CLTaskSampler(TaskSampler):
                 updates.append(env)
 
         elif self._env_type == 'dmlab':
+            import deepmind_lab
 
             LEVELS = ['lt_chasm', 
                       'lt_hallway_slope',
@@ -593,6 +593,7 @@ class CLTaskSampler(TaskSampler):
                 eval_updates.append(env)
 
         elif self._env_type == "dm_control":
+            from garage.envs.dm_control import DMControlEnv, dmc_task_name
             task_seq = [self.DM_CONTROL_ENV_SEQS[i] for i in task_seq_idx]
             for domain, task in task_seq:
                 env = DMControlEnv.from_suite(domain, task)

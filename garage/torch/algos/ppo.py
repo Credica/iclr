@@ -2,7 +2,7 @@
 import torch
 
 from garage.torch.algos import VPG
-from garage.torch.optimizers import OptimizerWrapper
+from garage.torch.optimizers import BellmanBurdenAdam, OptimizerWrapper
 
 class PPO(VPG):
     """Proximal Policy Optimization (PPO).
@@ -65,6 +65,7 @@ class PPO(VPG):
                  q_reset=False,
                  policy_reset=False,
                  first_task = None,
+                 first_task_steps=int(3e6),
                  use_wandb=True,
                  crelu=False,
                  infer=False,
@@ -72,6 +73,43 @@ class PPO(VPG):
                  ReDo=False,
                  no_stats=False,
                  multi_input=False,
+                 bellman_spectral_stats=False,
+                 bellman_spectral_anchor_size=64,
+                 bellman_spectral_fit_lr=5e-4,
+                 bellman_spectral_ridge=1e-3,
+                 bellman_spectral_task_steps=(15000, 60000, 105000,
+                                              510000, 1005000, 1500000),
+                 bellman_probe_dir='bellman_probe_results',
+                 ppo_value_reference_dir=None,
+                 ppo_value_reference_mode='load',
+                 pbsr=False,
+                 pbsr_coef=0.1,
+                 pbsr_anchor_size=64,
+                 pbsr_targets=8,
+                 pbsr_ridge=1e-3,
+                 pbsr_update_interval=100,
+                 pbsr_train_task_count=1,
+                 pbsr_train_task_indices=None,
+                 pbsr_variant='v1',
+                 pbsr_v2_actor=True,
+                 pbsr_v2_horizons=(1, 3, 5),
+                 pbsr_v2_bandwidth=0.5,
+                 ppo_bolt=False,
+                 ppo_bolt_rank=4,
+                 ppo_bolt_rho=0.5,
+                 ppo_bolt_ridge=0.1,
+                 ppo_bolt_calibration_size=32,
+                 ppo_bolt_update_interval=1000,
+                 ppo_bolt_history_columns=24,
+                 ppo_bolt_horizons=(1, 3, 5),
+                 ppo_bolt_train_task_indices=None,
+                 ppo_bolt_update_mode='innovation',
+                 ppo_bolt_reset_first_moment=False,
+                 ppo_spectral_advantage=False,
+                 ppo_spectral_advantage_ridge=0.1,
+                 ppo_spectral_advantage_block_size=128,
+                 ppo_spectral_advantage_train_task_indices=None,
+                 task_names=None,
                  policy_lr=5e-4,
                  value_lr=5e-4,
                  max_optimization_epochs=32,
@@ -84,8 +122,13 @@ class PPO(VPG):
                 max_optimization_epochs=max_optimization_epochs,
                 minibatch_size=minibatch_size)
         if vf_optimizer is None:
+            value_optimizer = (
+                BellmanBurdenAdam if ppo_bolt else torch.optim.Adam)
+            value_optimizer_args = dict(lr=value_lr)
+            if ppo_bolt:
+                value_optimizer_args['update_mode'] = ppo_bolt_update_mode
             vf_optimizer = OptimizerWrapper(
-                (torch.optim.Adam, dict(lr=value_lr)),
+                (value_optimizer, value_optimizer_args),
                 value_function,
                 max_optimization_epochs=max_optimization_epochs,
                 minibatch_size=minibatch_size)
@@ -112,13 +155,56 @@ class PPO(VPG):
                          q_reset=q_reset,
                          policy_reset=policy_reset,
                          first_task=first_task,
+                         first_task_steps=first_task_steps,
                          use_wandb=use_wandb,
                          crelu=crelu,
                          infer=infer,
                          wasserstein=wasserstein, 
                          ReDo=ReDo,
                          no_stats=no_stats, 
-                         multi_input=multi_input)
+                         multi_input=multi_input,
+                         bellman_spectral_stats=bellman_spectral_stats,
+                         bellman_spectral_anchor_size=bellman_spectral_anchor_size,
+                         bellman_spectral_fit_lr=bellman_spectral_fit_lr,
+                         bellman_spectral_ridge=bellman_spectral_ridge,
+                         bellman_spectral_task_steps=bellman_spectral_task_steps,
+                         bellman_probe_dir=bellman_probe_dir,
+                         ppo_value_reference_dir=ppo_value_reference_dir,
+                         ppo_value_reference_mode=ppo_value_reference_mode,
+                         pbsr=pbsr,
+                         pbsr_coef=pbsr_coef,
+                         pbsr_anchor_size=pbsr_anchor_size,
+                         pbsr_targets=pbsr_targets,
+                         pbsr_ridge=pbsr_ridge,
+                         pbsr_update_interval=pbsr_update_interval,
+                         pbsr_train_task_count=pbsr_train_task_count,
+                         pbsr_train_task_indices=pbsr_train_task_indices,
+                         pbsr_variant=pbsr_variant,
+                         pbsr_v2_actor=pbsr_v2_actor,
+                         pbsr_v2_horizons=pbsr_v2_horizons,
+                         pbsr_v2_bandwidth=pbsr_v2_bandwidth,
+                         ppo_bolt=ppo_bolt,
+                         ppo_bolt_rank=ppo_bolt_rank,
+                         ppo_bolt_rho=ppo_bolt_rho,
+                         ppo_bolt_ridge=ppo_bolt_ridge,
+                         ppo_bolt_calibration_size=(
+                             ppo_bolt_calibration_size),
+                         ppo_bolt_update_interval=ppo_bolt_update_interval,
+                         ppo_bolt_history_columns=ppo_bolt_history_columns,
+                         ppo_bolt_horizons=ppo_bolt_horizons,
+                         ppo_bolt_train_task_indices=(
+                             ppo_bolt_train_task_indices),
+                         ppo_bolt_update_mode=ppo_bolt_update_mode,
+                         ppo_bolt_reset_first_moment=(
+                             ppo_bolt_reset_first_moment),
+                         ppo_spectral_advantage=ppo_spectral_advantage,
+                         ppo_spectral_advantage_ridge=(
+                             ppo_spectral_advantage_ridge),
+                         ppo_spectral_advantage_block_size=(
+                             ppo_spectral_advantage_block_size),
+                         ppo_spectral_advantage_train_task_indices=(
+                             ppo_spectral_advantage_train_task_indices),
+                         task_names=task_names)
 
         self._lr_clip_range = lr_clip_range
 

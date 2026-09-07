@@ -1,0 +1,27 @@
+# Python caches and local tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.vscode/
+
+# Runtime logs
+*.log
+*.out
+*.err
+slurm-*.out
+
+# Experiment artifacts (never commit generated data or checkpoints)
+/logs/
+/models/
+/rollouts/
+/buffers/
+/bellman_probe_results/
+/results/
+/runs/
+/outputs/
+/checkpoints/
+/wandb/

@@ -83,8 +83,15 @@ if args.wandb:
     )
 
 START_STEPS = 0
+_sac_collection_batch = 1000 if args.env_type == 'dm_control' else 500
 if args.rl_method == 'sac':
     START_STEPS = int(1e4)
+    if (args.dsr_v2 or args.bellman_geometry or args.bellman_response or
+            args.sac_optimizer == 'muon' or args.sac_singular_clip or
+            args.exact_sac_task_budget):
+        # 预热样本收集后也执行一批 critic 更新；扣除这批对应的交互偏移，
+        # 使 v2 和几何方法每个任务恰好得到 steps_per_task 次更新。
+        START_STEPS -= _sac_collection_batch
 _steps_per_task = args.steps_per_task
 _gpu = args.device_type
 
@@ -115,11 +122,28 @@ elif args.env_type == 'dm_control':
 trainer = Trainer(None)
 
 if args.rl_method == 'sac':
-    timesteps = _steps_per_task * n_tasks
+    train_task_count = args.train_task_count or n_tasks
+    if args.branch_checkpoint:
+        timesteps = _steps_per_task - args.branch_task_step
+        if args.bellman_response or args.sac_optimizer == 'muon':
+            # 响应实验从 A 检查点继续执行后面所有任务，不能在 B 结束就退出。
+            import torch
+            if args.sac_optimizer == 'muon':
+                from garage.torch.algos.sac_muon import muon_branch_steps as branch_steps
+            else:
+                from garage.torch.algos.sac_bellman_response import response_branch_steps as branch_steps
+            checkpoint_info = torch.load(args.branch_checkpoint, map_location='cpu')
+            timesteps = branch_steps(
+                checkpoint_info, train_task_count, _steps_per_task, args.branch_task_step)
+            del checkpoint_info
+        if timesteps <= 0:
+            raise ValueError('branch_task_step must be smaller than steps_per_task')
+        if args.branch_run_steps is not None:
+            timesteps = min(timesteps, args.branch_run_steps)
+    else:
+        timesteps = _steps_per_task * train_task_count
     
-    batch_size = 500
-    if args.env_type == 'dm_control':
-        batch_size = 1000
+    batch_size = _sac_collection_batch
     num_evaluation_steps = args.num_evaluation_steps
     epoch_cycles = num_evaluation_steps // batch_size
     epochs = timesteps // (batch_size * epoch_cycles)
@@ -129,8 +153,9 @@ elif args.rl_method == 'ppo':
 
     if args.env_type == 'dm_control':
         batch_size = 10000
+    train_task_count = args.train_task_count or len(env_seq)
     epochs = _steps_per_task // batch_size
-    epochs *= len(env_seq)
+    epochs *= train_task_count
     epoch_cycles = 0 # We do not use this
 
 # set_gpu_mode before get_algo
@@ -153,7 +178,7 @@ trainer.train(n_epochs=epochs, batch_size=batch_size)
 
 log_name = make_log_name(env_seq, args) 
 
-if len(env_seq) == 1:
+if len(env_seq) == 1 and not args.bellman_probe:
     if (args.first_task is None) or (env_seq[0] == args.first_task):
         algo.save_models(log_name=log_name)
         if args.rl_method == 'sac':

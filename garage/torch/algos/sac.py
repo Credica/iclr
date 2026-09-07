@@ -1,6 +1,7 @@
 """This modules creates a sac model in PyTorch."""
 from collections import deque
 import copy
+import json
 
 from dowel import tabular
 import numpy as np
@@ -11,7 +12,19 @@ import torch.nn.functional as F
 from garage import log_performance, obtain_evaluation_episodes, StepType
 from garage.np.algos import RLAlgorithm
 from garage.torch import as_torch_dict, global_device, state_dict_to, np_to_torch
+from garage.torch.algos.bellman_spectral_stats import (
+    BellmanSpectralStats, deterministic_soft_bellman_directions)
+from garage.torch.algos.pbsr import PBSRHead
+from garage.torch.algos.sac_plasticity_injection import (
+    select_plasticity_width)
+from garage.torch.algos.sac_demand_aligned_reserve import (
+    SACDemandAlignedReserve)
+from garage.torch.algos.sac_dsr_v2 import (
+    SACDSRV2, restore_branches as restore_dsr_v2_branches,
+    zero_head_gradients, step_heads)
 from garage.torch._functions import list_to_tensor, zero_optim_grads, weight_deviation, weight_hessian, feature_rank
+from garage.torch.q_functions.continuous_mlp_q_function import (
+    PlasticityInjectionBranch)
 from time import time
 
 import wandb
@@ -42,6 +55,46 @@ def load_model(model, model_name, first_task, seed):
     model.load_state_dict(copied_model_state_dict)
 
     return
+
+
+def select_branch_critic_states(checkpoint, random_qf1, random_qf2,
+                                online_source, target_source):
+    """Select online and target critic states for a boundary branch."""
+    inherited = (checkpoint['qf1'], checkpoint['qf2'])
+    fresh = (random_qf1, random_qf2)
+    online_qf1, online_qf2 = {
+        'inherited': inherited,
+        'fresh': fresh,
+    }[online_source]
+    target_qf1, target_qf2 = {
+        'inherited': inherited,
+        'fresh': fresh,
+    }[target_source]
+    return {
+        'qf1': online_qf1,
+        'qf2': online_qf2,
+        'target_qf1': target_qf1,
+        'target_qf2': target_qf2,
+    }
+
+
+def critic_first_batch_stats(q1_pred, q2_pred, target_q1, target_q2,
+                             soft_bootstrap, bellman_target, rewards):
+    """Summarize the unmodified critic quantities on a first task batch."""
+    values = {
+        'online_q1_mean': q1_pred.mean(),
+        'online_q2_mean': q2_pred.mean(),
+        'online_min_q_mean': torch.min(q1_pred, q2_pred).mean(),
+        'target_q1_mean': target_q1.mean(),
+        'target_q2_mean': target_q2.mean(),
+        'target_min_q_mean': torch.min(target_q1, target_q2).mean(),
+        'soft_bootstrap_mean': soft_bootstrap.mean(),
+        'bellman_target_mean': bellman_target.mean(),
+        'reward_mean': rewards.mean(),
+        'qf1_td_abs_mean': (bellman_target - q1_pred).abs().mean(),
+        'qf2_td_abs_mean': (bellman_target - q2_pred).abs().mean(),
+    }
+    return {name: float(value.detach()) for name, value in values.items()}
 
 
 class SAC(RLAlgorithm):
@@ -162,7 +215,53 @@ class SAC(RLAlgorithm):
             wasserstein = 0, 
             ReDo = False, 
             no_stats=False, 
-            multi_input=False):
+            multi_input=False,
+            bellman_probe=False,
+            bellman_probe_size=1024,
+            bellman_probe_interval=100000,
+            bellman_probe_targets=8,
+            bellman_probe_ridge=1e-3,
+            bellman_probe_dir='bellman_probe_results',
+            bellman_spectral_stats=False,
+            bellman_spectral_anchor_size=64,
+            bellman_spectral_fit_lr=3e-4,
+            bellman_reference_dir=None,
+            bellman_spectral_task_steps=(10000, 50000, 100000, 500000,
+                                         1000000, 1500000),
+            pbsr=False,
+            pbsr_coef=0.1,
+            pbsr_anchor_size=64,
+            pbsr_targets=8,
+            pbsr_ridge=1e-3,
+            pbsr_update_interval=100,
+            pbsr_train_task_count=1,
+            task_names=None,
+            exact_task_budget=False,
+            branch_checkpoint=None,
+            branch_task_step=0,
+            branch_alpha=None,
+            branch_online_critic_source='inherited',
+            branch_target_critic_source='inherited',
+            plasticity_injection_mode='none',
+            plasticity_injection_width=256,
+            plasticity_injection_widths=(32, 64, 128, 256),
+            plasticity_injection_rows=64,
+            plasticity_injection_targets=8,
+            plasticity_injection_ridge=1e-3,
+            plasticity_injection_task_indices=None,
+            demand_aligned_reserve=False,
+            dar_rows=64,
+            dar_hidden_dim=256,
+            dar_feature_dim=64,
+            dar_targets=8,
+            dar_ridge=1e-3,
+            dar_trace_ratio=1.0,
+            dar_capacity_price=0.0,
+            dar_alignment_steps=200,
+            dar_alignment_lr=1e-3,
+            dar_task_indices=None,
+            dsr_v2=False,
+            dsr_v2_kwargs=None):
 
         self._qf1 = qf1
         self._qf2 = qf2
@@ -181,6 +280,73 @@ class SAC(RLAlgorithm):
         self._ReDo = ReDo
         self._no_stats = no_stats
         self._multi_input = multi_input
+        self._bellman_probe = bellman_probe
+        self._bellman_probe_size = bellman_probe_size
+        self._bellman_probe_interval = bellman_probe_interval
+        self._bellman_probe_targets = bellman_probe_targets
+        self._bellman_probe_ridge = bellman_probe_ridge
+        self._bellman_spectral_stats_enabled = bool(bellman_spectral_stats)
+        self._pbsr_enabled = bool(pbsr)
+        self._pbsr_update_interval = int(pbsr_update_interval)
+        self._pbsr_train_task_count = int(pbsr_train_task_count)
+        self._pbsr_last_stats = {}
+        self._pbsr = (
+            PBSRHead(
+                anchor_size=pbsr_anchor_size,
+                target_count=pbsr_targets,
+                ridge=pbsr_ridge,
+                gradient_ratio=pbsr_coef,
+                seed=seed)
+            if self._pbsr_enabled else None)
+        self._bellman_probe_buffers = {}
+        self._bellman_probe_task_start_step = 0
+        self._task_names = task_names
+        self._branch_task_step = branch_task_step
+        self._plasticity_injection_mode = plasticity_injection_mode
+        self._plasticity_injection_width = int(plasticity_injection_width)
+        self._plasticity_injection_widths = tuple(
+            int(width) for width in plasticity_injection_widths)
+        self._plasticity_injection_rows = int(plasticity_injection_rows)
+        self._plasticity_injection_targets = int(
+            plasticity_injection_targets)
+        self._plasticity_injection_ridge = float(plasticity_injection_ridge)
+        self._plasticity_injection_task_indices = (
+            None if plasticity_injection_task_indices is None else
+            set(int(index) for index in plasticity_injection_task_indices))
+        self._plasticity_injection_records = []
+        self._plasticity_injected_tasks = set()
+        self._demand_aligned_reserve_enabled = bool(
+            demand_aligned_reserve)
+        self._dar_rows = int(dar_rows)
+        self._dar_task_indices = (
+            None if dar_task_indices is None else
+            set(int(index) for index in dar_task_indices))
+        self._dar_prepared_tasks = set()
+        self._dar_records = []
+        # v2 使用独立开关，原版 DAR 的实现和实验入口保持可用。
+        self._dsr_v2_enabled = bool(dsr_v2)
+        if self._dsr_v2_enabled and (demand_aligned_reserve or
+                plasticity_injection_mode != 'none' or q_reset):
+            raise ValueError('DSR v2 请单独启用，不能同时使用 DAR、PI 或 q_reset')
+        self._dsr_v2 = SACDSRV2(
+            num_tasks=len(task_names) if task_names else 1,
+            **(dsr_v2_kwargs or {}))
+        self._demand_aligned_reserve = SACDemandAlignedReserve(
+            capacity_price=dar_capacity_price,
+            hidden_dim=dar_hidden_dim,
+            feature_dim=dar_feature_dim,
+            target_count=dar_targets,
+            relative_ridge=dar_ridge,
+            trace_ratio=dar_trace_ratio,
+            alignment_steps=dar_alignment_steps,
+            alignment_lr=dar_alignment_lr,
+        )
+        if self._pbsr_update_interval < 1:
+            raise ValueError('pbsr_update_interval must be positive.')
+        if self._pbsr_train_task_count < 1:
+            raise ValueError('pbsr_train_task_count must be positive.')
+        self._critic_optimizer_steps = 0
+        self._restored_branch_alpha = None
 
         # Total number of CL tasks
         self.masks = None
@@ -188,6 +354,52 @@ class SAC(RLAlgorithm):
         self._log_name = log_name
         self._use_wandb = use_wandb
 
+        if self._bellman_probe:
+            self._bellman_probe_run_dir = os.path.join(
+                bellman_probe_dir, self._log_name)
+            self._bellman_probe_checkpoint_dir = os.path.join(
+                self._bellman_probe_run_dir, 'checkpoints')
+            os.makedirs(self._bellman_probe_checkpoint_dir, exist_ok=True)
+            self._bellman_probe_metrics_path = os.path.join(
+                self._bellman_probe_run_dir, 'metrics.jsonl')
+            self._bellman_spectral_probe = (
+                BellmanSpectralStats(
+                    run_dir=self._bellman_probe_run_dir,
+                    anchor_size=bellman_spectral_anchor_size,
+                    target_count=bellman_probe_targets,
+                    relative_ridge=bellman_probe_ridge,
+                    fit_learning_rate=bellman_spectral_fit_lr,
+                    reference_dir=bellman_reference_dir,
+                    task_steps=bellman_spectral_task_steps,
+                    seed=seed)
+                if self._bellman_spectral_stats_enabled else None)
+        if self._pbsr_enabled:
+            pbsr_run_dir = os.path.join(bellman_probe_dir, self._log_name)
+            os.makedirs(pbsr_run_dir, exist_ok=True)
+            pbsr_config = {
+                'method': 'pbsr_head',
+                'probe_source': 'current_task_replay_minibatch',
+                'probe_definition': (
+                    'one_step_random_value_head_policy_mixture_'
+                    'random_cumulant'),
+                'policy_mixture': [
+                    'current_actor_mean', 'deterministic_noisy_actor',
+                    'task_independent_action'],
+                'bellman_horizons': [1],
+                'anchor_size': pbsr_anchor_size,
+                'target_count': pbsr_targets,
+                'normalized_kernel': 'HHt_over_d_then_trace_normalized',
+                'probe_column_normalization': 'center_then_unit_l2',
+                'ridge': pbsr_ridge,
+                'gradient_ratio': pbsr_coef,
+                'update_interval': self._pbsr_update_interval,
+                'train_task_count': self._pbsr_train_task_count,
+                'future_task_reference_used_for_training': False,
+            }
+            with open(os.path.join(
+                    pbsr_run_dir, 'pbsr_config.json'), 'w') as config_file:
+                json.dump(pbsr_config, config_file, indent=2)
+            print('PBSR_CONFIG', json.dumps(pbsr_config), flush=True)
         self._min_buffer_size = min_buffer_size
         self._steps_per_epoch = steps_per_epoch
         self._buffer_batch_size = buffer_batch_size
@@ -209,6 +421,7 @@ class SAC(RLAlgorithm):
         self._q_reset = q_reset
         self._policy_reset = policy_reset
         self._first_task = first_task
+        self._exact_task_budget = bool(exact_task_budget)
 
         self._temporal_regularization_factor = temporal_regularization_factor
         self._spatial_regularization_factor = spatial_regularization_factor
@@ -225,12 +438,9 @@ class SAC(RLAlgorithm):
         # use 2 target q networks
         self._target_qf1 = copy.deepcopy(self._qf1)
         self._target_qf2 = copy.deepcopy(self._qf2)
-        self._policy_optimizer = self._optimizer(self.policy.parameters(),
-                                                 lr=self._policy_lr)
-        self._qf1_optimizer = self._optimizer(self._qf1.parameters(),
-                                              lr=self._qf_lr)
-        self._qf2_optimizer = self._optimizer(self._qf2.parameters(),
-                                              lr=self._qf_lr)
+        self._policy_optimizer = self._make_network_optimizer(self.policy, self._policy_lr)
+        self._qf1_optimizer = self._make_network_optimizer(self._qf1, self._qf_lr)
+        self._qf2_optimizer = self._make_network_optimizer(self._qf2, self._qf_lr)
         
         # automatic entropy coefficient tuning
         self._use_automatic_entropy_tuning = fixed_alpha is None
@@ -263,6 +473,15 @@ class SAC(RLAlgorithm):
         self.results['Q loss'] = []
         self.results['Alpha'] = []
         self.results['Speed (it/s)'] = []
+        if self._pbsr_enabled:
+            self.results['PBSR Qf1 TD loss'] = []
+            self.results['PBSR Qf2 TD loss'] = []
+            self.results['PBSR Qf1 loss'] = []
+            self.results['PBSR Qf2 loss'] = []
+            self.results['PBSR Qf1 coefficient'] = []
+            self.results['PBSR Qf2 coefficient'] = []
+            self.results['PBSR Qf1 slowest30 energy'] = []
+            self.results['PBSR Qf2 slowest30 energy'] = []
 
         if self._no_stats == False:
         
@@ -312,6 +531,95 @@ class SAC(RLAlgorithm):
         
         if self._policy_reset:
             print('Reset policy when task is changed')
+
+        if branch_checkpoint is not None:
+            checkpoint = torch.load(branch_checkpoint, map_location='cpu')
+            if checkpoint.get('plasticity_injections'):
+                self._restore_plasticity_injections(
+                    checkpoint['plasticity_injections'])
+            if checkpoint.get('dsr_v2') is not None:
+                if not self._dsr_v2_enabled:
+                    raise ValueError('恢复 DSR v2 检查点时必须启用 --dsr_v2 True')
+                self._dsr_v2.load_state_dict(checkpoint['dsr_v2'])
+                for qf, target_qf, key in (
+                        (self._qf1, self._target_qf1, 'qf1'),
+                        (self._qf2, self._target_qf2, 'qf2')):
+                    restore_dsr_v2_branches(qf, target_qf, checkpoint[key])
+            self.policy.load_state_dict(checkpoint['policy'])
+            if branch_task_step > 0:
+                branch_states = {
+                    'qf1': checkpoint['qf1'],
+                    'qf2': checkpoint['qf2'],
+                    'target_qf1': checkpoint.get(
+                        'target_qf1', checkpoint['qf1']),
+                    'target_qf2': checkpoint.get(
+                        'target_qf2', checkpoint['qf2']),
+                }
+                online_source = 'checkpoint'
+                target_source = 'checkpoint'
+            else:
+                online_source = (
+                    'fresh' if self._q_reset
+                    else branch_online_critic_source)
+                target_source = (
+                    'fresh' if self._q_reset
+                    else branch_target_critic_source)
+                branch_states = select_branch_critic_states(
+                    checkpoint,
+                    self._random_qf1_state_dict,
+                    self._random_qf2_state_dict,
+                    online_source,
+                    target_source)
+            self._qf1.load_state_dict(branch_states['qf1'])
+            self._qf2.load_state_dict(branch_states['qf2'])
+            self._target_qf1.load_state_dict(branch_states['target_qf1'])
+            self._target_qf2.load_state_dict(branch_states['target_qf2'])
+
+            if 'policy_optimizer' in checkpoint:
+                self._policy_optimizer.load_state_dict(
+                    checkpoint['policy_optimizer'])
+            if 'qf1_optimizer' in checkpoint:
+                self._qf1_optimizer.load_state_dict(
+                    checkpoint['qf1_optimizer'])
+            if 'qf2_optimizer' in checkpoint:
+                self._qf2_optimizer.load_state_dict(
+                    checkpoint['qf2_optimizer'])
+
+            self.global_step = checkpoint['global_step']
+            if branch_task_step > 0:
+                self.seq_idx = int(checkpoint['seq_idx'])
+            else:
+                self.seq_idx = int(checkpoint.get('seq_idx', 0)) + 1
+            self._bellman_probe_task_start_step = (
+                self.global_step - branch_task_step)
+            self._bellman_probe_buffers = checkpoint.get('probe_buffers', {})
+            self._critic_optimizer_steps = (
+                int(checkpoint.get('critic_optimizer_steps', 0))
+                if branch_task_step > 0 else 0)
+            for env in self._sampler._envs:
+                env.cur_step = branch_task_step
+                env.cur_seq_idx = self.seq_idx
+
+            restored_alpha = branch_alpha
+            if restored_alpha is None and 'log_alpha' in checkpoint:
+                restored_alpha = float(
+                    torch.as_tensor(checkpoint['log_alpha']).exp().item())
+            self._restored_branch_alpha = restored_alpha
+            if restored_alpha is not None and self._use_automatic_entropy_tuning:
+                self._log_alpha = list_to_tensor(
+                    [restored_alpha]).log().requires_grad_()
+                self._alpha_optimizer = self._optimizer(
+                    [self._log_alpha], lr=self._policy_lr)
+
+            print('Loaded branch checkpoint:', branch_checkpoint)
+            print('Branch task/step:', self.seq_idx, branch_task_step)
+            if branch_task_step == 0:
+                print('BRANCH_CRITIC_INITIALIZATION', json.dumps({
+                    'online_source': online_source,
+                    'target_source': target_source,
+                    'q_reset_alias': bool(self._q_reset),
+                }))
+            print('Branch replay buffer starts empty.')
 
         if self._first_task is not None:
             if 'DMC' in self._first_task:
@@ -369,6 +677,193 @@ class SAC(RLAlgorithm):
                 self.policy.load_state_dict(self._random_policy_state_dict)
 
 
+    def _append_plasticity_branch(self, qf, target_qf, optimizer,
+                                  max_width, active_width, branch_seed):
+        branch = PlasticityInjectionBranch(
+            qf._obs_dim + qf._action_dim,
+            max_width=max_width,
+            active_width=active_width,
+            seed=branch_seed).to(next(qf.parameters()).device)
+        qf.append_plasticity_injection(branch)
+        target_qf.append_plasticity_injection(copy.deepcopy(branch))
+        optimizer.add_param_group({
+            'params': branch.trainable_parameters(),
+        })
+        return branch
+
+    def _restore_plasticity_injections(self, records):
+        for record in records:
+            self._append_plasticity_branch(
+                self._qf1, self._target_qf1, self._qf1_optimizer,
+                record['max_width'], record['selected_width'],
+                record['qf1_seed'])
+            self._append_plasticity_branch(
+                self._qf2, self._target_qf2, self._qf2_optimizer,
+                record['max_width'], record['selected_width'],
+                record['qf2_seed'])
+            self._plasticity_injected_tasks.add(int(record['task']))
+        self._plasticity_injection_records = copy.deepcopy(records)
+
+    def _make_network_optimizer(self, model, lr):
+        """默认完全沿用原优化器；Muon 子类仅替换网络参数的优化器。"""
+        return self._optimizer(model.parameters(), lr=lr)
+
+    def _plasticity_injection_due(self, seq_idx):
+        if self._plasticity_injection_mode == 'none' or seq_idx == 0:
+            return False
+        if seq_idx in self._plasticity_injected_tasks:
+            return False
+        return (self._plasticity_injection_task_indices is None or
+                seq_idx in self._plasticity_injection_task_indices)
+
+    def _apply_plasticity_injection(self, samples, seq_idx):
+        observations = samples['observation']
+        actions = samples['action']
+        device = observations.device
+        with torch.no_grad():
+            alpha = self._get_log_alpha(samples).exp()
+            q1_directions, q2_directions = (
+                deterministic_soft_bellman_directions(
+                    samples, seq_idx, self._qf1, self._qf2,
+                    self._target_qf1, self._target_qf2, self.policy, alpha,
+                    self._discount, self._reward_scale,
+                    self._plasticity_injection_targets))
+            q1_before = self._qf1(
+                observations, actions, seq_idx=seq_idx).clone()
+            q2_before = self._qf2(
+                observations, actions, seq_idx=seq_idx).clone()
+            target_q1_before = self._target_qf1(
+                observations, actions, seq_idx=seq_idx).clone()
+            target_q2_before = self._target_qf2(
+                observations, actions, seq_idx=seq_idx).clone()
+
+        max_width = max(
+            (self._plasticity_injection_width,) +
+            self._plasticity_injection_widths)
+        qf1_seed = self._seed * 100003 + seq_idx * 1009 + 7901
+        qf2_seed = qf1_seed + 53
+        branch1 = PlasticityInjectionBranch(
+            self._qf1._obs_dim + self._qf1._action_dim,
+            max_width=max_width,
+            active_width=max_width,
+            seed=qf1_seed).to(device)
+        branch2 = PlasticityInjectionBranch(
+            self._qf2._obs_dim + self._qf2._action_dim,
+            max_width=max_width,
+            active_width=max_width,
+            seed=qf2_seed).to(device)
+
+        fresh_qf1 = copy.deepcopy(self._random_qf1).to(device)
+        fresh_qf2 = copy.deepcopy(self._random_qf2).to(device)
+        fixed_width = (
+            self._plasticity_injection_width
+            if self._plasticity_injection_mode == 'fixed' else None)
+        selection = select_plasticity_width(
+            self._qf1, self._qf2, fresh_qf1, fresh_qf2,
+            branch1, branch2, observations, actions, seq_idx,
+            q1_directions, q2_directions,
+            self._plasticity_injection_widths,
+            self._plasticity_injection_ridge,
+            fixed_width=fixed_width)
+        selected_width = selection['selected_width']
+
+        self._qf1.append_plasticity_injection(branch1)
+        self._qf2.append_plasticity_injection(branch2)
+        self._target_qf1.append_plasticity_injection(copy.deepcopy(branch1))
+        self._target_qf2.append_plasticity_injection(copy.deepcopy(branch2))
+        self._qf1_optimizer.add_param_group({
+            'params': branch1.trainable_parameters(),
+        })
+        self._qf2_optimizer.add_param_group({
+            'params': branch2.trainable_parameters(),
+        })
+
+        with torch.no_grad():
+            q1_after = self._qf1(
+                observations, actions, seq_idx=seq_idx)
+            q2_after = self._qf2(
+                observations, actions, seq_idx=seq_idx)
+            target_q1_after = self._target_qf1(
+                observations, actions, seq_idx=seq_idx)
+            target_q2_after = self._target_qf2(
+                observations, actions, seq_idx=seq_idx)
+
+        record = {
+            'mode': self._plasticity_injection_mode,
+            'task': int(seq_idx),
+            'task_name': self._task_names[seq_idx],
+            'global_step': int(self.global_step),
+            'rows': int(len(observations)),
+            'target_count': self._plasticity_injection_targets,
+            'relative_ridge': self._plasticity_injection_ridge,
+            'max_width': max_width,
+            'selected_width': selected_width,
+            'qf1_seed': qf1_seed,
+            'qf2_seed': qf2_seed,
+            'qf1_output_drift': float((q1_after - q1_before).abs().max()),
+            'qf2_output_drift': float((q2_after - q2_before).abs().max()),
+            'target_qf1_output_drift': float(
+                (target_q1_after - target_q1_before).abs().max()),
+            'target_qf2_output_drift': float(
+                (target_q2_after - target_q2_before).abs().max()),
+        }
+        record.update(selection)
+        self._plasticity_injection_records.append(record)
+        self._plasticity_injected_tasks.add(seq_idx)
+
+        if self._bellman_probe:
+            artifact_path = os.path.join(
+                self._bellman_probe_run_dir,
+                'plasticity_injection_task{}.json'.format(seq_idx))
+            with open(artifact_path, 'w') as artifact_file:
+                json.dump(record, artifact_file, indent=2)
+        print('PLASTICITY_INJECTION', json.dumps(record), flush=True)
+
+    def _demand_aligned_reserve_due(self, seq_idx):
+        """判断当前新任务是否需要进行一次谱储备准备。"""
+        if not self._demand_aligned_reserve_enabled or seq_idx == 0:
+            return False
+        if seq_idx in self._dar_prepared_tasks:
+            return False
+        return (self._dar_task_indices is None or
+                seq_idx in self._dar_task_indices)
+
+    def _prepare_demand_aligned_reserve(self, samples, seq_idx):
+        """在新任务第一次 critic 更新前对齐或复用学习谱。"""
+        alpha = self._get_log_alpha(samples).exp().detach()
+        result = self._demand_aligned_reserve.prepare(
+            samples=samples,
+            task_idx=seq_idx,
+            qf1=self._qf1,
+            qf2=self._qf2,
+            target_qf1=self._target_qf1,
+            target_qf2=self._target_qf2,
+            qf1_optimizer=self._qf1_optimizer,
+            qf2_optimizer=self._qf2_optimizer,
+            policy=self.policy,
+            alpha=alpha,
+            discount=self._discount,
+            reward_scale=self._reward_scale,
+        )
+        record = {
+            'method': 'demand_aligned_reserve',
+            'task': int(seq_idx),
+            'task_name': self._task_names[seq_idx],
+            'global_step': int(self.global_step),
+            'rows': int(len(samples['observation'])),
+            'qf1': result['qf1'],
+            'qf2': result['qf2'],
+        }
+        self._dar_records.append(record)
+        self._dar_prepared_tasks.add(seq_idx)
+
+        if self._bellman_probe:
+            artifact_path = os.path.join(
+                self._bellman_probe_run_dir,
+                'demand_aligned_reserve_task{}.json'.format(seq_idx))
+            with open(artifact_path, 'w') as artifact_file:
+                json.dump(record, artifact_file, indent=2)
+        print('DEMAND_ALIGNED_RESERVE', json.dumps(record), flush=True)
 
     def train(self, trainer):
         """Obtain samplers and start actual training for each epoch.
@@ -388,6 +883,9 @@ class SAC(RLAlgorithm):
         if not self._eval_env:
             self._eval_env = trainer.get_env_copy()
         last_return = None
+        # 从 checkpoint 恢复时，吞吐分子只统计本次 train 调用新增的更新。
+        speed_start_step = self.global_step
+        speed_start_time = time()
         for env in self._sampler._envs:
             env.reset()
             
@@ -429,15 +927,18 @@ class SAC(RLAlgorithm):
                 
                 path_returns = []
                 for path in trainer.step_episode:
-                    self.replay_buffer.add_path(
-                        dict(observation=path['observations'],
-                             action=path['actions'],
-                             reward=path['rewards'].reshape(-1, 1),
-                             next_observation=path['next_observations'],
-                             terminal=np.array([
-                                 step_type == StepType.TERMINAL
-                                 for step_type in path['step_types']
-                             ]).reshape(-1, 1)))
+                    replay_path = dict(
+                        observation=path['observations'],
+                        action=path['actions'],
+                        reward=path['rewards'].reshape(-1, 1),
+                        next_observation=path['next_observations'],
+                        terminal=np.array([
+                            step_type == StepType.TERMINAL
+                            for step_type in path['step_types']
+                        ]).reshape(-1, 1))
+                    self.replay_buffer.add_path(replay_path)
+                    if self._bellman_probe:
+                        self._append_bellman_probe(replay_path, self.seq_idx)
                     path_returns.append(path['rewards'])
                     self.recent_trajectory.append(path)
                 assert len(path_returns) == len(trainer.step_episode)
@@ -449,11 +950,27 @@ class SAC(RLAlgorithm):
                     
                     policy_loss, qf1_loss, qf2_loss = self.train_once(self.seq_idx)
                     self.global_step += 1
+                    task_step = (
+                        self.global_step - self._bellman_probe_task_start_step)
+                    interval_probe_due = (
+                        self.global_step % self._bellman_probe_interval == 0)
+                    spectral_probe_due = (
+                        self._bellman_spectral_stats_enabled and
+                        self._bellman_spectral_probe.should_run(
+                            'interval', task_step))
+                    if (self._bellman_probe and
+                            (interval_probe_due or spectral_probe_due)):
+                        self._run_bellman_probe('interval', self.seq_idx)
+                        if interval_probe_due:
+                            self._save_bellman_probe_checkpoint(
+                                self.seq_idx, 'interval')
                     with torch.no_grad():
                         alpha = self._log_alpha.exp()
                     end_time = time()
                     
                     if self.global_step % 1000 == 0:
+                        training_speed = ((self.global_step - speed_start_step) /
+                                          max(end_time - speed_start_time, 1e-9))
 
                         if self._no_stats == False:
 
@@ -474,7 +991,7 @@ class SAC(RLAlgorithm):
                             action_dists, new_actions, log_pi_new_actions = self._get_policy_output(recent_obs, self.seq_idx)
 
                             policy_loss_hess = self._actor_objective(recent_samples, new_actions,
-                                                                log_pi_new_actions, seq_idx=self.seq_dx)
+                                                                log_pi_new_actions, seq_idx=self.seq_idx)
                             policy_loss_hess += self._caps_regularization_objective(
                                 action_dists, recent_samples, self.seq_idx)
                             
@@ -525,7 +1042,7 @@ class SAC(RLAlgorithm):
                                     'Policy loss': policy_loss.item(),
                                     'Q loss': (qf1_loss + qf2_loss).item(),
                                     'Alpha': alpha.item(),
-                                    'Speed (it/s)' : (self.global_step / (end_time - self.start_time)),
+                                    'Speed (it/s)' : training_speed,
                                     'Policy zero ratio': policy_zero_cnt,
                                     'Qf1 zero ratio': qf1_zero_cnt,
                                     'Qf2 zero ratio': qf2_zero_cnt,
@@ -545,7 +1062,7 @@ class SAC(RLAlgorithm):
                                     'Policy loss': policy_loss.item(),
                                     'Q loss': (qf1_loss + qf2_loss).item(),
                                     'Alpha': alpha.item(),
-                                    'Speed (it/s)' : (self.global_step / (end_time - self.start_time))
+                                    'Speed (it/s)' : training_speed
                                 })
 
 
@@ -553,7 +1070,37 @@ class SAC(RLAlgorithm):
                         self.results['Policy loss'].append(policy_loss.item())
                         self.results['Q loss'].append((qf1_loss + qf2_loss).item())
                         self.results['Alpha'].append(alpha.item())
-                        self.results['Speed (it/s)'].append((self.global_step / (end_time - self.start_time)))
+                        self.results['Speed (it/s)'].append(training_speed)
+                        if self._pbsr_enabled:
+                            pbsr_active = (
+                                self.seq_idx < self._pbsr_train_task_count and
+                                bool(self._pbsr_last_stats))
+                            q1_pbsr = (
+                                self._pbsr_last_stats['qf1']
+                                if pbsr_active else {})
+                            q2_pbsr = (
+                                self._pbsr_last_stats['qf2']
+                                if pbsr_active else {})
+                            self.results['PBSR Qf1 TD loss'].append(
+                                q1_pbsr.get('td_loss', float('nan')))
+                            self.results['PBSR Qf2 TD loss'].append(
+                                q2_pbsr.get('td_loss', float('nan')))
+                            self.results['PBSR Qf1 loss'].append(
+                                q1_pbsr.get('loss', float('nan')))
+                            self.results['PBSR Qf2 loss'].append(
+                                q2_pbsr.get('loss', float('nan')))
+                            self.results['PBSR Qf1 coefficient'].append(
+                                q1_pbsr.get('coefficient', float('nan')))
+                            self.results['PBSR Qf2 coefficient'].append(
+                                q2_pbsr.get('coefficient', float('nan')))
+                            self.results[
+                                'PBSR Qf1 slowest30 energy'].append(
+                                    q1_pbsr.get(
+                                        'slowest30_energy', float('nan')))
+                            self.results[
+                                'PBSR Qf2 slowest30 energy'].append(
+                                    q2_pbsr.get(
+                                        'slowest30_energy', float('nan')))
 
                         if self._no_stats == False:
                             self.results['Policy zero ratio'].append(policy_zero_cnt)
@@ -564,15 +1111,22 @@ class SAC(RLAlgorithm):
                             self.results['Qf2 feature rank'].append(qf2_feature_rank)
                             self.results['Policy hessian rank'].append(policy_hessian_rank)
                             self.results['Qf1 hessian rank'].append(qf1_hessian_rank)
-                            self.results['Qf2 hessian rank'].append(qf2_feature_rank)
+                            self.results['Qf2 hessian rank'].append(qf2_hessian_rank)
                             self.results['Policy weight change'].append(policy_dev.item())
                             self.results['Qf1 weight change'].append(qf1_dev.item())
                             self.results['Qf2 weight change'].append(qf2_dev.item())
                         
 
-                        print('STEP: {} '.format(self.global_step),'policy loss: {:.2f} '.format(policy_loss.item()), 'Q loss: {:.6f} '.format((qf1_loss + qf2_loss).item()), 'Alpha: {:.7f}'.format(alpha.item()), 'Reward avg.: {:.7f}'.format(sum(self.episode_rewards) / len(self.episode_rewards)), 'Speed: {:.1f} it/s'.format(self.global_step / (end_time - self.start_time)))
+                        print('STEP: {} '.format(self.global_step),'policy loss: {:.2f} '.format(policy_loss.item()), 'Q loss: {:.6f} '.format((qf1_loss + qf2_loss).item()), 'Alpha: {:.7f}'.format(alpha.item()), 'Reward avg.: {:.7f}'.format(sum(self.episode_rewards) / len(self.episode_rewards)), 'Speed: {:.1f} it/s'.format(training_speed))
                 
-                if self.seq_idx != getattr(self._sampler._envs[0], "cur_seq_idx"):
+                next_task = getattr(self._sampler._envs[0], "cur_seq_idx")
+                # v2 的精确预算会到达最后一个环境的结束边界，最终评估仍属于末任务。
+                dsr_v2_finished = ((self._dsr_v2_enabled or getattr(self, '_muon_enabled', False) or
+                                    getattr(self, '_singular_clip_enabled', False) or
+                                    getattr(self, '_bellman_response_enabled', False) or
+                                    self._exact_task_budget) and self._task_names and
+                                   next_task >= len(self._task_names))
+                if self.seq_idx != next_task and not dsr_v2_finished:
                     print('Task change')
                     print('Current task number =',self.seq_idx)
                     # NOTE: Must call self.task_change before changing self.seq_idx
@@ -584,7 +1138,187 @@ class SAC(RLAlgorithm):
             self.save_results()
             trainer.step_itr += 1
 
+        if self._bellman_probe:
+            final_task_idx = self.seq_idx
+            self._run_bellman_probe('final', final_task_idx)
+            self._save_bellman_probe_checkpoint(final_task_idx, 'final')
+
         return np.mean(last_return)
+
+    def _append_bellman_probe(self, path, seq_idx):
+        if seq_idx not in self._bellman_probe_buffers:
+            self._bellman_probe_buffers[seq_idx] = {
+                key: value[:0].copy() for key, value in path.items()
+            }
+
+        probe = self._bellman_probe_buffers[seq_idx]
+        remaining = self._bellman_probe_size - len(probe['observation'])
+        take = min(remaining, len(path['observation']))
+        if take > 0:
+            for key, value in path.items():
+                probe[key] = np.concatenate((probe[key], value[:take]))
+
+    @staticmethod
+    def _bellman_energy_rank(singular_values):
+        energy = singular_values.square()
+        cutoff = 0.99 * energy.sum()
+        return int(torch.searchsorted(torch.cumsum(energy, dim=0), cutoff).item() + 1)
+
+    def _run_bellman_probe(self, event, current_task_idx):
+        feature_blocks = []
+        demand_blocks = []
+        task_td_abs = {}
+        task_rows = {}
+        alpha_values = self._log_alpha.exp().detach()
+
+        with torch.no_grad():
+            for task_idx in sorted(self._bellman_probe_buffers):
+                probe = self._bellman_probe_buffers[task_idx]
+                obs = np_to_torch(probe['observation'])
+                actions = np_to_torch(probe['action'])
+                rewards = np_to_torch(probe['reward']).flatten()
+                next_obs = np_to_torch(probe['next_observation'])
+                terminals = np_to_torch(probe['terminal']).flatten()
+
+                q_pred = self._qf1(obs, actions, seq_idx=task_idx).flatten()
+                features = self._qf1._feature.detach().clone()
+                task_demands = []
+                alpha = (alpha_values[task_idx]
+                         if alpha_values.numel() > 1
+                         else alpha_values.reshape(()))
+                next_action_dist = self.policy(next_obs, task_idx)[0]
+                base_dist = next_action_dist._normal.base_dist
+                action_axis = torch.arange(
+                    1, base_dist.loc.shape[-1] + 1,
+                    device=base_dist.loc.device,
+                    dtype=base_dist.loc.dtype).unsqueeze(0)
+
+                for target_idx in range(self._bellman_probe_targets):
+                    noise = torch.sin((target_idx + 1) * action_axis)
+                    pre_tanh = base_dist.loc + base_dist.scale * noise
+                    next_actions = torch.tanh(pre_tanh)
+                    next_log_pi = next_action_dist.log_prob(
+                        value=next_actions, pre_tanh_value=pre_tanh)
+                    target_q1 = self._target_qf1(
+                        next_obs, next_actions, seq_idx=task_idx).flatten()
+                    target_q2 = self._target_qf2(
+                        next_obs, next_actions, seq_idx=task_idx).flatten()
+                    target = rewards * self._reward_scale + (
+                        1. - terminals) * self._discount * (
+                            torch.min(target_q1, target_q2) - alpha * next_log_pi)
+                    task_demands.append(target - q_pred)
+
+                task_demand = torch.stack(task_demands, dim=1)
+                feature_blocks.append(features)
+                demand_blocks.append(task_demand)
+                task_td_abs[str(task_idx)] = task_demand.abs().mean().item()
+                task_rows[str(task_idx)] = len(obs)
+
+            features = torch.cat(feature_blocks, dim=0)
+            demands = torch.cat(demand_blocks, dim=0)
+            features = features - features.mean(dim=0, keepdim=True)
+            demands = demands - demands.mean(dim=0, keepdim=True)
+
+            n_rows = features.shape[0]
+            feature_u, feature_s, _ = torch.linalg.svd(
+                features / np.sqrt(n_rows), full_matrices=False)
+            demand_u, demand_s, _ = torch.linalg.svd(
+                demands / np.sqrt(n_rows), full_matrices=False)
+            feature_rank = self._bellman_energy_rank(feature_s)
+            demand_rank = self._bellman_energy_rank(demand_s)
+
+            overlap = torch.matmul(
+                feature_u[:, :feature_rank].T,
+                demand_u[:, :demand_rank])
+            alignment = overlap.square().sum() / demand_rank
+
+            feature_gram = torch.matmul(features.T, features) / n_rows
+            ridge = (self._bellman_probe_ridge *
+                     torch.trace(feature_gram) / feature_gram.shape[0])
+            rhs = torch.matmul(features.T, demands) / n_rows
+            weights = torch.linalg.solve(
+                feature_gram + ridge * torch.eye(
+                    feature_gram.shape[0], device=feature_gram.device), rhs)
+            unexplained = demands - torch.matmul(features, weights)
+            coverage = 1. - unexplained.square().sum() / demands.square().sum()
+            stable_rank = feature_s.square().sum() / feature_s[0].square()
+
+        task_step = self.global_step - self._bellman_probe_task_start_step
+        metric = {
+            'event': event,
+            'global_step': self.global_step,
+            'current_task': current_task_idx,
+            'current_task_name': self._task_names[current_task_idx],
+            'task_step': task_step,
+            'feature_rank_99': feature_rank,
+            'feature_stable_rank': stable_rank.item(),
+            'bellman_demand_rank_99': demand_rank,
+            'bellman_alignment': alignment.item(),
+            'bellman_coverage': coverage.item(),
+            'bellman_misalignment': 1. - coverage.item(),
+            'task_td_abs': task_td_abs,
+            'task_rows': task_rows,
+            'feature_singular_values': feature_s.cpu().tolist(),
+            'bellman_singular_values': demand_s.cpu().tolist(),
+        }
+        if (self._bellman_spectral_stats_enabled and
+                self._bellman_spectral_probe.should_run(event, task_step)):
+            current_alpha = (
+                alpha_values[current_task_idx]
+                if alpha_values.numel() > 1
+                else alpha_values.reshape(()))
+            metric.update(self._bellman_spectral_probe.run(
+                event=event,
+                global_step=self.global_step,
+                task_step=task_step,
+                task_idx=current_task_idx,
+                task_name=self._task_names[current_task_idx],
+                probe=self._bellman_probe_buffers[current_task_idx],
+                qf1=self._qf1,
+                qf2=self._qf2,
+                target_qf1=self._target_qf1,
+                target_qf2=self._target_qf2,
+                policy=self.policy,
+                alpha=current_alpha,
+                discount=self._discount,
+                reward_scale=self._reward_scale))
+        with open(self._bellman_probe_metrics_path, 'a') as probe_file:
+            probe_file.write(json.dumps(metric) + '\n')
+        print('BELLMAN_PROBE', json.dumps({
+            key: value for key, value in metric.items()
+            if key not in ('feature_singular_values', 'bellman_singular_values')
+        }))
+
+    def _save_bellman_probe_checkpoint(self, seq_idx, event):
+        checkpoint_path = os.path.join(
+            self._bellman_probe_checkpoint_dir,
+            '{}_task{}_step{}.pt'.format(event, seq_idx, self.global_step))
+        torch.save({
+            'global_step': self.global_step,
+            'seq_idx': seq_idx,
+            'policy': self.policy.state_dict(),
+            'qf1': self._qf1.state_dict(),
+            'qf2': self._qf2.state_dict(),
+            'target_qf1': self._target_qf1.state_dict(),
+            'target_qf2': self._target_qf2.state_dict(),
+            'policy_optimizer': self._policy_optimizer.state_dict(),
+            'qf1_optimizer': self._qf1_optimizer.state_dict(),
+            'qf2_optimizer': self._qf2_optimizer.state_dict(),
+            'log_alpha': self._log_alpha.detach().cpu(),
+            'critic_optimizer_steps': self._critic_optimizer_steps,
+            'plasticity_injections': self._plasticity_injection_records,
+            'demand_aligned_reserve': self._dar_records,
+            'dsr_v2': (self._dsr_v2.state_dict()
+                       if self._dsr_v2_enabled else None),
+            'branch_task_step': self._branch_task_step,
+            'probe_buffers': self._bellman_probe_buffers,
+            'bellman_response': (self.response_checkpoint_state()
+                                 if hasattr(self, 'response_checkpoint_state') else None),
+            'muon': (self.muon_checkpoint_state()
+                     if hasattr(self, 'muon_checkpoint_state') else None),
+            'singular_clip': (self.singular_clip_checkpoint_state()
+                             if hasattr(self, 'singular_clip_checkpoint_state') else None),
+        }, checkpoint_path)
 
     def train_once(self, seq_idx, itr=None, paths=None):
         """Complete 1 training iteration of SAC.
@@ -603,6 +1337,39 @@ class SAC(RLAlgorithm):
         del itr
         del paths
         if self.replay_buffer.n_transitions_stored >= self._min_buffer_size:
+            if self._dsr_v2_enabled:
+                stage = self._dsr_v2.due_stage(seq_idx, self._critic_optimizer_steps)
+                rows = self._dsr_v2.rows
+                available = self.replay_buffer.n_transitions_stored
+                if stage is not None and available >= 2 * rows:
+                    # 同一次无放回抽样后分成两组，保证校准集和留出集不共用 transition。
+                    indices = np.random.choice(available, 2 * rows, replace=False)
+                    calibration = as_torch_dict(self.replay_buffer.sample_transitions(
+                        rows, idx=indices[:rows]))
+                    heldout = as_torch_dict(self.replay_buffer.sample_transitions(
+                        rows, idx=indices[rows:]))
+                    record = self._dsr_v2.prepare(
+                        calibration, heldout, seq_idx, stage, self._critic_optimizer_steps,
+                        (self._qf1, self._qf2), (self._target_qf1, self._target_qf2),
+                        (self._qf1_optimizer, self._qf2_optimizer), self.policy,
+                        self._get_log_alpha(calibration).exp().detach(),
+                        self._discount, self._reward_scale)
+                    record['global_step'] = int(self.global_step)
+                    print('DSR_V2', json.dumps(record), flush=True)
+                    if self._bellman_probe:
+                        with open(os.path.join(self._bellman_probe_run_dir,
+                                               'dsr_v2_events.jsonl'), 'a') as event_file:
+                            event_file.write(json.dumps(record) + '\n')
+            if self._demand_aligned_reserve_due(seq_idx):
+                reserve_samples = self.replay_buffer.sample_transitions(
+                    self._dar_rows)
+                self._prepare_demand_aligned_reserve(
+                    as_torch_dict(reserve_samples), seq_idx)
+            if self._plasticity_injection_due(seq_idx):
+                injection_samples = self.replay_buffer.sample_transitions(
+                    self._plasticity_injection_rows)
+                self._apply_plasticity_injection(
+                    as_torch_dict(injection_samples), seq_idx)
             samples = self.replay_buffer.sample_transitions(
                 self._buffer_batch_size)
             samples = as_torch_dict(samples)
@@ -768,7 +1535,8 @@ class SAC(RLAlgorithm):
         
         return policy_objective
 
-    def _critic_objective(self, samples_data, seq_idx):
+    def _critic_objective(self, samples_data, seq_idx,
+                          return_predictions=False):
         """Compute the Q-function/critic loss.
 
         Args:
@@ -818,9 +1586,22 @@ class SAC(RLAlgorithm):
             q_target = rewards * self._reward_scale + (
                 1. - terminals) * self._discount * target_q_values
 
+        if self._critic_optimizer_steps == 0:
+            first_batch = critic_first_batch_stats(
+                q1_pred.flatten(), q2_pred.flatten(), qf1.flatten(),
+                qf2.flatten(), target_q_values, q_target, rewards)
+            first_batch.update({
+                'global_step': self.global_step,
+                'task': int(seq_idx),
+                'alpha': float(alpha.detach()),
+            })
+            print('CRITIC_FIRST_BATCH', json.dumps(first_batch), flush=True)
+
         qf1_loss = F.mse_loss(q1_pred.flatten(), q_target)
         qf2_loss = F.mse_loss(q2_pred.flatten(), q_target)
 
+        if return_predictions:
+            return qf1_loss, qf2_loss, q1_pred, q2_pred, q_target
         return qf1_loss, qf2_loss
 
     def _caps_regularization_objective(self, action_dists, samples_data, seq_idx):
@@ -865,6 +1646,10 @@ class SAC(RLAlgorithm):
         qfs = [self._qf1, self._qf2]
         for target_qf, qf in zip(target_qfs, qfs):
             for t_param, param in zip(target_qf.parameters(), qf.parameters()):
+                if self._dsr_v2_enabled and not param.requires_grad:
+                    # 固定特征应逐位保持一致，避免反复 Polyak 运算引入舍入漂移。
+                    t_param.data.copy_(param.data)
+                    continue
                 t_param.data.copy_(t_param.data * (1.0 - self._tau) +
                                    param.data * self._tau)
 
@@ -892,7 +1677,9 @@ class SAC(RLAlgorithm):
 
         """
         obs = samples_data['observation']
-        qf1_loss, qf2_loss = self._critic_objective(samples_data, seq_idx)
+        critic_values = self._critic_objective(
+            samples_data, seq_idx, return_predictions=True)
+        qf1_loss, qf2_loss, q1_pred, q2_pred, q_target = critic_values
 
         if self._infer:
             obs = samples_data['observation']
@@ -907,14 +1694,59 @@ class SAC(RLAlgorithm):
             qf1_loss += self.wasserstein_reg_loss(self._qf1, self._wasserstein_target_qf1)
             qf2_loss += self.wasserstein_reg_loss(self._qf2, self._wasserstein_target_qf2)
 
+        pbsr_due = (
+            self._pbsr_enabled and
+            seq_idx < self._pbsr_train_task_count and
+            self._critic_optimizer_steps % self._pbsr_update_interval == 0)
+        if pbsr_due:
+            pbsr_diagnostics_due = (
+                self._critic_optimizer_steps < 10 or
+                self._critic_optimizer_steps % 1000 == 0)
+            with torch.no_grad():
+                pbsr_alpha = self._get_log_alpha(samples_data).exp()
+            q1_directions, q2_directions = self._pbsr.direction_banks(
+                samples_data, seq_idx, q1_pred, q2_pred,
+                self._target_qf1, self._target_qf2, self.policy, pbsr_alpha,
+                self._discount, self._reward_scale)
+            qf1_loss, q1_pbsr_stats = self._pbsr.critic_loss(
+                self._qf1, samples_data, seq_idx, q1_directions, qf1_loss,
+                compute_diagnostics=pbsr_diagnostics_due)
+            qf2_loss, q2_pbsr_stats = self._pbsr.critic_loss(
+                self._qf2, samples_data, seq_idx, q2_directions, qf2_loss,
+                compute_diagnostics=pbsr_diagnostics_due)
+            self._pbsr_last_stats = {
+                'global_step': int(self.global_step),
+                'critic_optimizer_step': int(self._critic_optimizer_steps + 1),
+                'task': int(seq_idx),
+                'qf1': q1_pbsr_stats,
+                'qf2': q2_pbsr_stats,
+            }
+            if pbsr_diagnostics_due:
+                print(
+                    'PBSR_UPDATE', json.dumps(self._pbsr_last_stats),
+                    flush=True)
+
         zero_optim_grads(self._qf1_optimizer)
+        if self._dsr_v2_enabled:
+            zero_head_gradients(self._qf1)
         qf1_loss.backward()
         self._qf1_optimizer.step()
+        if self._dsr_v2_enabled:
+            step_heads(self._qf1)
 
         zero_optim_grads(self._qf2_optimizer)
+        if self._dsr_v2_enabled:
+            zero_head_gradients(self._qf2)
         qf2_loss.backward()
         self._qf2_optimizer.step()
+        if self._dsr_v2_enabled:
+            step_heads(self._qf2)
 
+        self._critic_optimizer_steps += 1
+        # 新方法在真实双 critic TD 更新后、actor 更新前施加独立参数修正。
+        # 原有算法没有此钩子，继续执行完全相同的优化路径。
+        if hasattr(self, '_after_critic_update'):
+            self._after_critic_update(samples_data, seq_idx)
 
         # action_dists = self.policy(obs, seq_idx)[0]
         # new_actions_pre_tanh, new_actions = (
@@ -941,7 +1773,6 @@ class SAC(RLAlgorithm):
 
         zero_optim_grads(self._policy_optimizer)
         policy_loss.backward()
-
         self._policy_optimizer.step()
 
         if self._use_automatic_entropy_tuning:
@@ -1002,12 +1833,17 @@ class SAC(RLAlgorithm):
             self._log_alpha = list_to_tensor([self._fixed_alpha]).log()
 
     def task_change(self, seq_idx):
+        if self._bellman_probe:
+            self._run_bellman_probe('task_boundary', seq_idx)
+            self._save_bellman_probe_checkpoint(seq_idx, 'task_boundary')
+
         self.on_task_start(seq_idx)
 
         if self._ReDo and (seq_idx+1) < len(self._eval_env):
             self.ReDo(seq_idx)
 
         self.replay_buffer.clear()
+        self._critic_optimizer_steps = 0
         self._reset_alpha()
         self.recent_trajectory.clear()
 
@@ -1020,6 +1856,9 @@ class SAC(RLAlgorithm):
 
         self._target_qf1.load_state_dict(qf1_state_dict)
         self._target_qf2.load_state_dict(qf2_state_dict)
+
+        if self._bellman_probe:
+            self._bellman_probe_task_start_step = self.global_step
     
     def save_models(self, log_name = None):
 
@@ -1033,7 +1872,10 @@ class SAC(RLAlgorithm):
             os.makedirs('models/sac_models')
 
         for net, name in zip(self.networks, self.networks_names):
-            torch.save(net.state_dict(), './models/sac_models' + name + '_' + log_name + '.pt')
+            torch.save(
+                net.state_dict(),
+                os.path.join('models', 'sac_models',
+                             name + '_' + log_name + '.pt'))
 
         
     def save_buffers(self, log_name = None):
@@ -1049,7 +1891,8 @@ class SAC(RLAlgorithm):
 
         buffer_data = self.replay_buffer.get_all_transitions()
         buffer_data = as_torch_dict(buffer_data)
-        path = './buffers/sac_buffers' + log_name + '.pkl'
+        path = os.path.join(
+            'buffers', 'sac_buffers', log_name + '.pkl')
         with open(path, 'wb') as f:
             pickle.dump(buffer_data, f)
     

@@ -10,7 +10,6 @@ from garage.sampler.env_update import (EnvUpdate,
 from garage.sampler.fragment_worker import FragmentWorker
 from garage.sampler.local_sampler import LocalSampler
 from garage.sampler.multiprocessing_sampler import MultiprocessingSampler
-from garage.sampler.ray_sampler import RaySampler
 from garage.sampler.sampler import Sampler
 from garage.sampler.vec_worker import VecWorker
 from garage.sampler.worker import Worker
@@ -24,7 +23,6 @@ __all__ = [
     'FragmentWorker',
     'Sampler',
     'LocalSampler',
-    'RaySampler',
     'MultiprocessingSampler',
     'VecWorker',
     'WorkerFactory',

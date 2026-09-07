@@ -118,6 +118,52 @@ class MTSAC(SAC):
         ReDo = False,
         no_stats = False,
         multi_input = False,
+        bellman_probe=False,
+        bellman_probe_size=1024,
+        bellman_probe_interval=100000,
+        bellman_probe_targets=8,
+        bellman_probe_ridge=1e-3,
+        bellman_probe_dir='bellman_probe_results',
+        bellman_spectral_stats=False,
+        bellman_spectral_anchor_size=64,
+        bellman_spectral_fit_lr=3e-4,
+        bellman_reference_dir=None,
+        bellman_spectral_task_steps=(10000, 50000, 100000, 500000,
+                                     1000000, 1500000),
+        pbsr=False,
+        pbsr_coef=0.1,
+        pbsr_anchor_size=64,
+        pbsr_targets=8,
+        pbsr_ridge=1e-3,
+        pbsr_update_interval=100,
+        pbsr_train_task_count=1,
+        task_names=None,
+        exact_task_budget=False,
+        branch_checkpoint=None,
+        branch_task_step=0,
+        branch_alpha=None,
+        branch_online_critic_source='inherited',
+        branch_target_critic_source='inherited',
+        plasticity_injection_mode='none',
+        plasticity_injection_width=256,
+        plasticity_injection_widths=(32, 64, 128, 256),
+        plasticity_injection_rows=64,
+        plasticity_injection_targets=8,
+        plasticity_injection_ridge=1e-3,
+        plasticity_injection_task_indices=None,
+        demand_aligned_reserve=False,
+        dar_rows=64,
+        dar_hidden_dim=256,
+        dar_feature_dim=64,
+        dar_targets=8,
+        dar_ridge=1e-3,
+        dar_trace_ratio=1.0,
+        dar_capacity_price=0.0,
+        dar_alignment_steps=200,
+        dar_alignment_lr=1e-3,
+        dar_task_indices=None,
+        dsr_v2=False,
+        dsr_v2_kwargs=None,
     ):
 
         super().__init__(
@@ -156,7 +202,53 @@ class MTSAC(SAC):
             wasserstein=wasserstein, 
             ReDo=ReDo,
             no_stats=no_stats,
-            multi_input=multi_input)
+            multi_input=multi_input,
+            bellman_probe=bellman_probe,
+            bellman_probe_size=bellman_probe_size,
+            bellman_probe_interval=bellman_probe_interval,
+            bellman_probe_targets=bellman_probe_targets,
+            bellman_probe_ridge=bellman_probe_ridge,
+            bellman_probe_dir=bellman_probe_dir,
+            bellman_spectral_stats=bellman_spectral_stats,
+            bellman_spectral_anchor_size=bellman_spectral_anchor_size,
+            bellman_spectral_fit_lr=bellman_spectral_fit_lr,
+            bellman_reference_dir=bellman_reference_dir,
+            bellman_spectral_task_steps=bellman_spectral_task_steps,
+            pbsr=pbsr,
+            pbsr_coef=pbsr_coef,
+            pbsr_anchor_size=pbsr_anchor_size,
+            pbsr_targets=pbsr_targets,
+            pbsr_ridge=pbsr_ridge,
+            pbsr_update_interval=pbsr_update_interval,
+            pbsr_train_task_count=pbsr_train_task_count,
+            task_names=task_names,
+            exact_task_budget=exact_task_budget,
+            branch_checkpoint=branch_checkpoint,
+            branch_task_step=branch_task_step,
+            branch_alpha=branch_alpha,
+            branch_online_critic_source=branch_online_critic_source,
+            branch_target_critic_source=branch_target_critic_source,
+            plasticity_injection_mode=plasticity_injection_mode,
+            plasticity_injection_width=plasticity_injection_width,
+            plasticity_injection_widths=plasticity_injection_widths,
+            plasticity_injection_rows=plasticity_injection_rows,
+            plasticity_injection_targets=plasticity_injection_targets,
+            plasticity_injection_ridge=plasticity_injection_ridge,
+            plasticity_injection_task_indices=(
+                plasticity_injection_task_indices),
+            demand_aligned_reserve=demand_aligned_reserve,
+            dar_rows=dar_rows,
+            dar_hidden_dim=dar_hidden_dim,
+            dar_feature_dim=dar_feature_dim,
+            dar_targets=dar_targets,
+            dar_ridge=dar_ridge,
+            dar_trace_ratio=dar_trace_ratio,
+            dar_capacity_price=dar_capacity_price,
+            dar_alignment_steps=dar_alignment_steps,
+            dar_alignment_lr=dar_alignment_lr,
+            dar_task_indices=dar_task_indices,
+            dsr_v2=dsr_v2,
+            dsr_v2_kwargs=dsr_v2_kwargs)
         self._num_tasks = num_tasks
         self._eval_env = eval_env
         self._use_automatic_entropy_tuning = fixed_alpha is None
@@ -176,7 +268,11 @@ class MTSAC(SAC):
                 else:
                     self._target_entropy = -np.prod(
                             self.env_spec.action_space.shape).item()
-            self._log_alpha = torch.Tensor([self._initial_log_entropy] *
+            initial_log_alpha = (
+                np.log(self._restored_branch_alpha)
+                if self._restored_branch_alpha is not None
+                else self._initial_log_entropy)
+            self._log_alpha = torch.Tensor([initial_log_alpha] *
                                            self._num_tasks).requires_grad_()
             self._alpha_optimizer = optimizer([self._log_alpha] *
                                               self._num_tasks,
@@ -289,8 +385,12 @@ class MTSAC(SAC):
             self._log_alpha = torch.Tensor([self._fixed_alpha] *
                                            self._num_tasks).log().to(device)
         else:
+            initial_log_alpha = (
+                np.log(self._restored_branch_alpha)
+                if self._restored_branch_alpha is not None
+                else self._initial_log_entropy)
             self._log_alpha = torch.Tensor(
-                [self._initial_log_entropy] *
+                [initial_log_alpha] *
                 self._num_tasks).to(device).requires_grad_()
             self._alpha_optimizer = self._optimizer([self._log_alpha],
                                                     lr=self._policy_lr)

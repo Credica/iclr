@@ -18,13 +18,18 @@ import wandb
 
 
 class RND_SAC(MTSAC):
-    def __init__(self, cl_reg_coef=1.0, expert_buffer_size=10000, replay_buffer_size=int(1e6), nepochs_offline=5, env_seq=None, bc_kl='reverse', distill_kl='forward', reset_offline_actor=False, **sac_kwargs):
+    def __init__(self, cl_reg_coef=1.0, expert_buffer_size=10000,
+                 replay_buffer_size=int(1e6), nepochs_offline=5,
+                 env_seq=None, bc_kl='reverse', distill_kl='forward',
+                 reset_offline_actor=False, teacher_steps=int(3e6),
+                 **sac_kwargs):
         super().__init__(**sac_kwargs)
         self._cl_reg_coef=cl_reg_coef
         self._expert_buffer_size=expert_buffer_size
         self._replay_buffer_size=replay_buffer_size
         self._nepochs_offline = nepochs_offline
         self._reset_offline_actor=reset_offline_actor
+        self._teacher_steps = int(teacher_steps)
         self._env_seq=env_seq
         self._bc_kl = bc_kl
         self._distill_kl=distill_kl
@@ -54,7 +59,8 @@ class RND_SAC(MTSAC):
         target_task_name = self._env_seq[0]
         
         # Skip first task & load policy
-        model_name = 'policy_metaworld_sac_{}_3000000_{}.pt'.format(target_task_name, self._seed)
+        model_name = 'policy_metaworld_sac_{}_{}_{}.pt'.format(
+            target_task_name, self._teacher_steps, self._seed)
         # model_name = 'policy_metaworld_sac_{}_{}.pt'.format(target_task_name, self._seed)
     
         target_policy_state_dict = torch.load('./models/sac_models/'+model_name, map_location=global_device())
@@ -183,8 +189,10 @@ class RND_SAC(MTSAC):
 
         target_task_name = self._env_seq[seq_idx]
 
-        model_name = 'policy_metaworld_sac_{}_3000000_{}.pt'.format(target_task_name, self._seed)
-        buffer_name = 'rollouts_metaworld_sac_{}_3000000_{}.pkl'.format(target_task_name, self._seed)
+        model_name = 'policy_metaworld_sac_{}_{}_{}.pt'.format(
+            target_task_name, self._teacher_steps, self._seed)
+        buffer_name = 'rollouts_metaworld_sac_{}_{}_{}.pkl'.format(
+            target_task_name, self._teacher_steps, self._seed)
 
         # Load policy
         target_policy = copy.deepcopy(self.policy)
@@ -254,7 +262,10 @@ class RND_SAC(MTSAC):
     
 class RND_PPO(PPO):
 
-    def __init__(self, cl_reg_coef=1.0, expert_buffer_size=10000, replay_buffer_size=int(1e6), nepochs_offline=5, env_seq=None, bc_kl='reverse', distill_kl='forward', **ppo_kwargs):
+    def __init__(self, cl_reg_coef=1.0, expert_buffer_size=10000,
+                 replay_buffer_size=int(1e6), nepochs_offline=5,
+                 env_seq=None, bc_kl='reverse', distill_kl='forward',
+                 teacher_steps=int(3e6), **ppo_kwargs):
         super().__init__(**ppo_kwargs)
 
         self._cl_reg_coef=cl_reg_coef
@@ -264,6 +275,7 @@ class RND_PPO(PPO):
         self._env_seq=env_seq
         self._bc_kl = bc_kl
         self._distill_kl=distill_kl
+        self._teacher_steps = int(teacher_steps)
 
         print('BC: ', bc_kl, ' Distill: ', distill_kl)
 
@@ -290,7 +302,9 @@ class RND_PPO(PPO):
         if 'DMC' in target_task_name:
             task_list = list(range(tasknum))
         else:# Skip first task & load policy
-            model_name = 'policy_metaworld_ppo_{}_{}.pt'.format(target_task_name, self._seed)
+            task_list = list(range(1, tasknum))
+            model_name = 'policy_metaworld_ppo_{}_{}_{}.pt'.format(
+                target_task_name, self._teacher_steps, self._seed)
         
             target_policy_state_dict = torch.load('./models/ppo_models/'+model_name, map_location=global_device())
             policy_state_dict = self.policy.state_dict()
@@ -407,7 +421,8 @@ class RND_PPO(PPO):
     def load_target_policy_and_buffer(self, seq_idx):
 
         target_task_name = self._env_seq[seq_idx]
-        model_name = 'policy_metaworld_ppo_{}_3000000_{}.pt'.format(target_task_name, self._seed)
+        model_name = 'policy_metaworld_ppo_{}_{}_{}.pt'.format(
+            target_task_name, self._teacher_steps, self._seed)
 
         # Load policy
         target_policy = copy.deepcopy(self.policy)
@@ -427,7 +442,8 @@ class RND_PPO(PPO):
         
         batch_size = 512
 
-        buffer_name = 'rollouts_metaworld_ppo_{}_{}.pkl'.format(self._env_seq[seq_idx], self._seed)
+        buffer_name = 'metaworld_ppo_{}_{}_{}.pkl'.format(
+            self._env_seq[seq_idx], self._teacher_steps, self._seed)
             
         _device = "cpu"
         if global_device() != None:
@@ -473,5 +489,3 @@ class RND_PPO(PPO):
         std_loss = 0.5 * (((std1/std2)**2 - 2*(log_std1 - log_std2))).sum(dim=-1).mean()
 
         return mu_loss + std_loss
-    
-    
