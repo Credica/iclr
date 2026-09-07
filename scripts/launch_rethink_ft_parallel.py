@@ -27,6 +27,12 @@ def job_specs(gpus, run_gpu=None):
     return [job for job in jobs if run_gpu is None or job['gpu'] == run_gpu]
 
 
+def target_window_args(enabled):
+    """Return runner arguments; a bare --window-starts disables all windows."""
+    starts = ['10000', '100000', '500000', '1000000'] if enabled else []
+    return ['--window-starts'] + starts
+
+
 def prepare_batch(repo, root, args):
     root.mkdir(parents=True, exist_ok=False)
     source = root / 'source_snapshot'
@@ -59,6 +65,10 @@ def prepare_batch(repo, root, args):
         steps_per_task=1500000, warmup_included=10000,
         eval_interval=50000, eval_episodes=50,
         wandb=args.wandb == 'true', wandb_project=args.wandb_project,
+        target_windows=args.target_windows == 'true',
+        target_window_starts=(
+            [10000, 100000, 500000, 1000000]
+            if args.target_windows == 'true' else []),
         source_snapshot=str(source),
         prepared_at=time.strftime('%Y-%m-%dT%H:%M:%S%z')))
     commands = []
@@ -70,11 +80,13 @@ def prepare_batch(repo, root, args):
             'LD_LIBRARY_PATH=/home/zqy/.mujoco/mujoco210/bin:/usr/lib/nvidia '
             '{python} -B -u {launcher} --root {root} --run-gpu {gpu} '
             '--gpus {gpus} --wandb {wandb} --wandb-project {project} '
+            '--target-windows {target_windows} '
             '>> {root}/launcher_logs/gpu{gpu}_supervisor.log 2>&1"'.format(
                 prefix=session_prefix, gpu=gpu, repo=repo, python=sys.executable,
                 launcher=source / 'scripts' / 'launch_rethink_ft_parallel.py',
                 root=root, gpus=gpu_text, wandb=args.wandb,
-                project=args.wandb_project))
+                project=args.wandb_project,
+                target_windows=args.target_windows))
     (root / 'per_gpu_tmux_commands.txt').write_text('\n'.join(commands) + '\n')
 
 
@@ -93,8 +105,10 @@ def launch_jobs(root, args, selected_jobs, manifest_path):
                    LD_LIBRARY_PATH='/home/zqy/.mujoco/mujoco210/bin:/usr/lib/nvidia')
         command = [sys.executable, '-B', '-u', str(source / 'scripts' / 'rethink_ft_recorded.py'),
                    '--pair', spec['pair'], '--seed', str(spec['seed']),
-                   '--output', str(root / 'runs' / run_id),
-                   '--wandb', args.wandb, '--wandb-project', args.wandb_project]
+                   '--output', str(root / 'runs' / run_id)]
+        command.extend(target_window_args(args.target_windows == 'true'))
+        command.extend(['--wandb', args.wandb,
+                        '--wandb-project', args.wandb_project])
         log_path = root / 'launcher_logs' / (run_id + '.log')
         with log_path.open('wb') as handle:
             worker = subprocess.Popen(command, cwd=str(source), env=env, stdout=handle,
@@ -106,6 +120,10 @@ def launch_jobs(root, args, selected_jobs, manifest_path):
     manifest = dict(status='running', supervisor_pid=os.getpid(), concurrency=len(jobs), jobs=jobs,
                     gpu_order=args.gpus, run_gpu=args.run_gpu,
                     wandb=args.wandb == 'true', wandb_project=args.wandb_project,
+                    target_windows=args.target_windows == 'true',
+                    target_window_starts=(
+                        [10000, 100000, 500000, 1000000]
+                        if args.target_windows == 'true' else []),
                     source_snapshot=str(source), started_at=time.strftime('%Y-%m-%dT%H:%M:%S%z'))
     write_json(manifest_path, manifest)
     while True:
@@ -132,6 +150,9 @@ def main():
     parser.add_argument('--root', required=True)
     parser.add_argument('--wandb', choices=('true', 'false'), default='true')
     parser.add_argument('--wandb-project', default='Reset-Distill')
+    parser.add_argument(
+        '--target-windows', choices=('true', 'false'), default='false',
+        help='Record 1000-update critic trajectories (default: false for baselines)')
     parser.add_argument('--gpus', type=int, nargs='+', default=[0, 1, 2, 3, 6],
                         help='Physical GPU IDs used round-robin (default: 0 1 2 3 6)')
     parser.add_argument('--prepare-only', action='store_true')
