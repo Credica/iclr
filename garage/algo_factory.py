@@ -14,7 +14,8 @@ from garage.torch.value_functions import GaussianMLPValueFunction
 
 from garage.torch.algos import BC_SAC, BC_PPO
 from garage.torch.algos import RND_SAC, RND_PPO
-from garage.torch.algos import Finetuning_SAC, Finetuning_PPO
+from garage.torch.algos import (
+    Finetuning_SAC, Finetuning_PPO, SpectralRegularizedSAC)
 
 
 from garage.torch.algos import EWC_SAC, EWC_PPO
@@ -28,6 +29,18 @@ def get_algo(args, spec, n_tasks, train_envs, test_envs, train_info, env_seq):
     response_enabled = getattr(args, 'bellman_response', False)
     muon_enabled = getattr(args, 'sac_optimizer', 'adam') == 'muon'
     singular_clip_enabled = getattr(args, 'sac_singular_clip', False)
+    spectral_enabled = args.cl_method == 'spectral'
+    if spectral_enabled:
+        incompatible = ('bellman_geometry', 'bellman_response', 'pbsr', 'dsr_v2',
+                        'demand_aligned_reserve', 'q_reset', 'policy_reset', 'ReDo',
+                        'crelu', 'infer', 'wasserstein',
+                        'use_exploration', 'sac_singular_clip')
+        if (muon_enabled or rl_method != 'sac' or args.branch_checkpoint or
+                args.first_task or
+                any(getattr(args, name, False) for name in incompatible) or
+                getattr(args, 'plasticity_injection_mode', 'none') != 'none'):
+            raise ValueError(
+                'SpectralReg 仅支持从头训练、无其他干预的普通 Adam SAC')
     if singular_clip_enabled:
         incompatible = ('bellman_geometry', 'bellman_response', 'pbsr', 'dsr_v2',
                         'demand_aligned_reserve', 'q_reset', 'policy_reset', 'ReDo',
@@ -84,12 +97,16 @@ def get_algo(args, spec, n_tasks, train_envs, test_envs, train_info, env_seq):
             qf1 = ContinuousMLPQFunction(env_spec=spec,
                                          infer=args.infer,
                                          hidden_sizes=hidden_sizes,
-                                         hidden_nonlinearity=hidden_nonlinearity)
+                                         hidden_nonlinearity=hidden_nonlinearity,
+                                         ReDo=args.ReDo,
+                                         no_stats=args.no_stats)
 
             qf2 = ContinuousMLPQFunction(env_spec=spec,
                                          infer=args.infer,
                                          hidden_sizes=hidden_sizes,
-                                         hidden_nonlinearity=hidden_nonlinearity)
+                                         hidden_nonlinearity=hidden_nonlinearity,
+                                         ReDo=args.ReDo,
+                                         no_stats=args.no_stats)
             replay_buffer = PathBuffer(capacity_in_transitions=int(1e6),)
             
             if isinstance(spec,list):
@@ -125,7 +142,12 @@ def get_algo(args, spec, n_tasks, train_envs, test_envs, train_info, env_seq):
                 'infer': args.infer,
                 'wasserstein': args.wasserstein,
                 'ReDo': args.ReDo,
+                'redo_interval': args.redo_interval,
+                'redo_tau': args.redo_tau,
                 'no_stats': args.no_stats,
+                'scalar_log_interval': args.scalar_log_interval,
+                'feature_stats_interval': args.feature_stats_interval,
+                'hessian_stats_interval': args.hessian_stats_interval,
                 'bellman_probe': args.bellman_probe,
                 'bellman_probe_size': args.bellman_probe_size,
                 'bellman_probe_interval': args.bellman_probe_interval,
@@ -208,7 +230,12 @@ def get_algo(args, spec, n_tasks, train_envs, test_envs, train_info, env_seq):
                 'infer': args.infer,
                 'wasserstein': args.wasserstein,
                 'ReDo': args.ReDo,
+                'redo_interval': args.redo_interval,
+                'redo_tau': args.redo_tau,
                 'no_stats': args.no_stats,
+                'scalar_log_interval': args.scalar_log_interval,
+                'feature_stats_interval': args.feature_stats_interval,
+                'hessian_stats_interval': args.hessian_stats_interval,
                 'bellman_probe': args.bellman_probe,
                 'bellman_probe_size': args.bellman_probe_size,
                 'bellman_probe_interval': args.bellman_probe_interval,
@@ -228,6 +255,7 @@ def get_algo(args, spec, n_tasks, train_envs, test_envs, train_info, env_seq):
                 'pbsr_update_interval': args.pbsr_update_interval,
                 'pbsr_train_task_count': args.pbsr_train_task_count,
                 'task_names': env_seq,
+                'exact_task_budget': args.exact_sac_task_budget,
                 'branch_checkpoint': args.branch_checkpoint,
                 'branch_task_step': args.branch_task_step,
                 'branch_alpha': args.branch_alpha,
@@ -309,6 +337,13 @@ def get_algo(args, spec, n_tasks, train_envs, test_envs, train_info, env_seq):
                 else:
                     algo = Finetuning_SAC(**sac_kwargs)
 
+            if args.cl_method == 'spectral':
+                algo = SpectralRegularizedSAC(
+                    **sac_kwargs,
+                    actor_coef=args.spectral_actor_coef,
+                    critic_coef=args.spectral_critic_coef,
+                    power_iterations=args.spectral_power_iterations)
+
             if args.cl_method == 'bc':
                 algo = BC_SAC(**sac_kwargs,
                             cl_reg_coef=args.cl_reg_coef, 
@@ -323,7 +358,8 @@ def get_algo(args, spec, n_tasks, train_envs, test_envs, train_info, env_seq):
                                     bc_kl=args.bc_kl,
                                     distill_kl=args.distill_kl,
                                     reset_offline_actor=args.reset_offline_actor,
-                                    teacher_steps=args.rd_teacher_steps)
+                                    teacher_steps=args.rd_teacher_steps,
+                                    teacher_root=args.rd_teacher_root)
             
             if args.cl_method == 'ewc':
                 algo = EWC_SAC(**sac_kwargs, cl_reg_coef=args.cl_reg_coef)

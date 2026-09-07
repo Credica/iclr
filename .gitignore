@@ -13,6 +13,7 @@ htmlcov/
 *.out
 *.err
 slurm-*.out
+queue_status.tsv
 
 # Experiment artifacts (never commit generated data or checkpoints)
 /logs/

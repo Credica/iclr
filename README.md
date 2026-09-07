@@ -63,7 +63,7 @@ conda install pytorch==1.13.1 torchvision==0.14.1 torchaudio==0.13.1 pytorch-cud
 python -m pip install --requirement requirements.txt
 ```
 
-`requirements.txt` records the packages actually present in the environment used by the running experiments. In particular, MetaWorld is pinned to the exact Git commit installed there. The older `environment.yaml` is retained as a historical full Conda export, but it is not the recommended installation entry point: its `deepmind-lab==1.0` and `metaworld==0.1.0` PyPI entries are no longer independently installable from the current public index.
+`requirements.txt` records the packages actually present in the environment used by the running experiments. In particular, MetaWorld is pinned to the exact Git commit installed there. Use this documented installation path rather than the historical full Conda export: the latter referenced `deepmind-lab==1.0` and `metaworld==0.1.0` entries that are no longer independently installable from the current public index.
 
 ### 4. Verify the installation
 
@@ -76,12 +76,117 @@ python -c "import mujoco_py; print(mujoco_py.utils.discover_mujoco())"
 The command should print a path ending in `.mujoco/mujoco210`. Then run a non-rendering DM Control smoke test:
 
 ```bash
-python -c "from dm_control import suite; env = suite.load('walker', 'walk'); ts = env.reset(); ts = env.step(env.action_spec().generate_value()); print(ts.observation.keys())"
+MUJOCO_GL=osmesa python -c "from dm_control import suite; env = suite.load('walker', 'walk'); ts = env.reset(); ts = env.step(env.action_spec().generate_value()); print(ts.observation.keys())"
 ```
 
-Environment creation and non-rendering `walker`/`cartpole` reset-and-step tests have been validated on Linux. Rendering backends such as EGL remain machine-specific. Experiment launch commands will be documented separately after the execution interface is finalized.
+Environment creation and non-rendering `walker`/`cartpole` reset-and-step tests have been validated on Linux with OSMesa. The generated queue commands set `MUJOCO_GL=osmesa`; EGL remains machine-specific and is unnecessary for these non-rendering training runs.
 
 MuJoCo references: [MuJoCo 2.1.0 release](https://github.com/google-deepmind/mujoco/releases/tag/2.1.0) and the archived [`mujoco-py` installation guide](https://github.com/openai/mujoco-py#install-mujoco).
+
+### 5. Configure Weights & Biases
+
+W&B logging is enabled by default. Authenticate once on each experiment
+machine; the credential must remain in W&B's local user configuration and must
+never be committed to this repository:
+
+```bash
+wandb login
+```
+
+Use `--wandb false` for an intentionally offline run. Local JSONL/checkpoint
+records remain authoritative regardless of W&B availability.
+
+### 6. Queue two workers per GPU
+
+#### Fixed baseline protocol for the two experiment machines
+
+请按本节的固定配置运行，不要把仓库中其他研究入口混入这批 baseline：
+
+| Item | Fixed setting |
+|---|---|
+| Optimizer | Standard Adam SAC, explicitly `--sac_optimizer adam` |
+| Excluded optimizer | **Muon is not used in any teacher or baseline run** |
+| Baselines | FT, critic Reset, EWC, P&C, Spectral regularization, ReDo, R&D |
+| Task streams | F1, F2, F3, D-W6, D-C4 |
+| Seeds | 1, 2, 3 |
+| Online budget | 1,500,000 environment interactions per task, replay warm-up included |
+| Evaluation | Every 10,000 environment steps, 50 episodes |
+| Parallelism | Eight local GPUs per machine, at most two independent runs per GPU |
+| Tracking | W&B enabled; stdout/stderr, manifests, probes and checkpoints saved locally |
+| Output location | The supplied artifact root outside the Git checkout |
+
+The generated command lines contain `--sac_optimizer adam`; this is intentional
+and must not be changed to `muon`. The repository contains experimental Muon
+code for unrelated studies, but neither the 105-run baseline matrix nor its R&D
+teacher prerequisites use it. This launcher covers the seven baselines only;
+Clip (ours) and the separate rethink matrix are not silently added to the queue.
+
+The method-specific settings generated for this batch are:
+
+| Baseline | Fixed command setting |
+|---|---|
+| FT | `--cl_method finetuning` |
+| Reset | FT plus `--q_reset True`; reset both critics and critic Adam state |
+| EWC | `--cl_method ewc --cl_reg_coef 1.0` |
+| P&C | `--cl_method pandc --cl_reg_coef 1.0 --use_pandc_bc False --reset_column True --reset_adaptor True` |
+| SpectralReg | Actor and both online critics, coefficients `1e-4`, one power iteration |
+| ReDo | `--ReDo True --redo_interval 1000 --redo_tau 0.1` |
+| R&D | `--cl_method rnd --cl_reg_coef 1.0 --rd_teacher_steps 1500000` with an explicit teacher root |
+
+[`scripts/run_two_per_gpu_queue.sh`](scripts/run_two_per_gpu_queue.sh) runs at
+most two experiment processes on each local GPU. Its job file contains one
+complete shell command per non-empty line. When a process finishes, the next
+pending command is launched automatically on the released GPU; failed commands
+are recorded and do not stop the rest of the queue.
+
+The two physical machines use separate entry scripts and do not communicate.
+Each script generates its own fixed command list and JSON assignment manifest
+under the supplied artifact root. Prepare and inspect both manifests before
+removing `--prepare-only`:
+
+```bash
+# Run this only on machine 1 (53 main-study jobs).
+bash scripts/run_baselines_machine_1.sh \
+    /data/reset-distill/baselines --prepare-only
+bash scripts/run_baselines_machine_1.sh /data/reset-distill/baselines --run
+
+# Run this only on machine 2 (52 main-study jobs).
+bash scripts/run_baselines_machine_2.sh \
+    /data/reset-distill/baselines --prepare-only
+bash scripts/run_baselines_machine_2.sh /data/reset-distill/baselines --run
+```
+
+The commands inherit `CUDA_VISIBLE_DEVICES` from the queue. Consequently,
+commands using `main_garage.py` must select logical device 0 with
+`--device_type 0`, even when the queue assigns them to another physical GPU.
+Activate the `reset-distill` environment before starting the queue and keep the
+artifact root outside the Git repository. The generated 105-run matrix contains
+seven baselines, five sequences, and three seeds. Machine 1 receives 53 runs
+(440 task positions) and machine 2 receives 52 runs (400 task positions). The
+domain-aware allocation avoids duplicating most R&D teachers across the two
+hosts: machine 1 prepares all 48 Meta-World teacher/task/seed artifacts and
+machine 2 prepares all 15 DMC artifacts, with no teacher duplicated across
+hosts. Each launcher first runs its generated teacher prerequisite queue, reuses
+already complete model+rollout pairs, and starts the baseline queue only after
+all prerequisites succeed.
+
+All online SAC/teacher commands enable W&B and use actual environment steps:
+
+| Recorded values | Interval |
+|---|---:|
+| Loss, reward, alpha, training speed, zero ratio | 1,000 environment steps |
+| Feature rank and weight change | 10,000 environment steps |
+| Hessian rank | 10,000 environment steps, immediately before the matching evaluation |
+| Evaluation | 10,000 environment steps, 50 episodes |
+| Bellman probe | 100,000 environment steps |
+| Full Bellman spectral statistics | Fixed points: 10k, 50k, 100k, 500k, 1M, 1.5M |
+
+Generated results stay under the external artifact root, not in the Git
+checkout. R&D's student phase is offline and therefore records distillation
+update count/time rather than pretending those updates are environment
+interactions. Its launcher first trains or reuses every required single-task
+teacher and rollout, then starts distillation only if the prerequisite queue
+finishes without failures.
 
 ## Current experiment code
 
@@ -92,6 +197,22 @@ The first recorded FT batch for the six fixed transfer directions is implemented
 - `scripts/test_rethink_ft_recorded.py`
 
 The full main-study matrix is not yet ready to launch. The remaining implementation and validation gates are listed in `EXPERIMENT_PLAN_20260907.md`; a method name or command-line flag must not be treated as evidence that the final protocol is implemented.
+
+The eight planned main-study methods are FT, critic Reset, EWC, Progress &
+Compress (P&C), Spectral regularization, ReDo, Reset & Distill (R&D), and
+Clip (ours). P&C replaces the previously planned FAME baseline. The repository also
+provides a SAC SpectralReg entry point, `--cl_method spectral`, implementing the
+ICLR 2025 k=2 objective on the actor and both online critics with default
+coefficients of `1e-4` and one power iteration. For the multi-head actor, it
+regularizes the shared layers and current task's mean/log-standard-deviation
+heads without modifying inactive task heads. Formal launch commands will be
+documented after the unified runner passes the experiment-plan smoke gates.
+The `--ReDo True` SAC path recycles neurons every 1k task-local environment
+steps with a fixed normalized mean-absolute-activation threshold of 0.1. It
+reinitializes dormant incoming parameters, zeros their outgoing connections,
+clears the affected Adam moments, synchronizes both target critics, and records
+each recycling event. The generated baseline commands fix these values rather
+than running a threshold/frequency sweep.
 
 ## Repository policy
 

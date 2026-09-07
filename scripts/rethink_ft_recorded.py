@@ -6,6 +6,7 @@ Heavy Jacobian/kernel/fitting analysis is OFFLINE, using the recorded weights,
 inputs, exact targets and Adam states. No spectral intervention is applied.
 """
 import argparse
+from collections import deque
 import contextlib
 import copy
 import hashlib
@@ -24,10 +25,12 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
+import wandb
 
 from garage import EnvSpec
 from garage.replay_buffer import PathBuffer
 from garage.torch import as_torch_dict, set_gpu_mode
+from garage.torch._functions import feature_rank, weight_deviation, weight_hessian
 from garage.torch.algos.finetuning import Finetuning_SAC
 from garage.torch.policies import TanhGaussianMLPPolicy
 from garage.torch.q_functions import ContinuousMLPQFunction
@@ -41,6 +44,23 @@ PAIRS = {
     'P6': ['window-close-v2', 'reach-v2'],
 }
 TRANSITION_KEYS = ('observation', 'action', 'reward', 'next_observation', 'terminal')
+CLOCK_KEYS = {
+    'global_env_step', 'task_env_step', 'global_critic_updates',
+    'task_critic_updates', 'train_task_position', 'policy_head',
+    'occurrence_id',
+}
+
+
+def str2bool(value):
+    """Parse an explicit command-line boolean without silent fallbacks."""
+    if isinstance(value, bool):
+        return value
+    lowered = value.lower()
+    if lowered in ('true', '1', 'yes', 'y'):
+        return True
+    if lowered in ('false', '0', 'no', 'n'):
+        return False
+    raise argparse.ArgumentTypeError('expected true or false')
 
 
 def stable_seed(*parts):
@@ -132,6 +152,128 @@ def summary_values(tensor):
                 quantiles=np.quantile(array, [0, .1, .5, .9, 1]).tolist())
 
 
+def _flatten_numeric(prefix, value, output):
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            _flatten_numeric(prefix + '/' + str(key), nested, output)
+    elif isinstance(value, (list, tuple)):
+        for index, nested in enumerate(value):
+            _flatten_numeric(prefix + '/' + str(index), nested, output)
+    elif isinstance(value, (bool, int, float, np.number)):
+        output[prefix] = value.item() if isinstance(value, np.number) else value
+
+
+def wandb_payload(namespace, row):
+    """Flatten every numeric JSONL field into a W&B-safe metric mapping."""
+    output = {}
+    for key, value in row.items():
+        prefix = ('clock/' if key in CLOCK_KEYS else namespace + '/') + key
+        _flatten_numeric(prefix, value, output)
+    return output
+
+
+def _network_state(models):
+    return {name: copy.deepcopy(model.state_dict())
+            for name, model in zip(('policy', 'qf1', 'qf2'), models)}
+
+
+def _recent_zero_ratio(model):
+    values = model._stats.get('zero_ratio', [])
+    if not values:
+        raise RuntimeError('zero-ratio statistics were not enabled for {}'.format(
+            type(model).__name__))
+    return float(np.mean(values[-1000:]))
+
+
+def _trim_activation_stats(models):
+    """Bound diagnostic list growth while retaining the old rolling window."""
+    for model in models:
+        stats = getattr(model, '_stats', None)
+        if not stats:
+            continue
+        for key in ('zero_ratio', 'dormant'):
+            if key in stats and len(stats[key]) > 1000:
+                stats[key][:] = stats[key][-1000:]
+
+
+def compute_plasticity_metrics(algo, samples, seq_idx, previous_states,
+                               normalization_count=10000):
+    """Compute the original SAC plasticity statistics without changing RNG.
+
+    The definitions match the legacy online block: rolling activation-zero
+    ratios, ranks of normalized penultimate features and output-layer
+    Hessians, and state-dict weight deviation since the preceding report.
+    """
+    models = (algo.policy, algo._qf1, algo._qf2)
+    capture, capture_update = algo.capture, algo.capture_update
+    zero_ratios = [_recent_zero_ratio(model) for model in models]
+    current_states = _network_state(models)
+    try:
+        algo.capture = algo.capture_update = False
+        with isolated_rng():
+            qf1_loss, qf2_loss = algo._critic_objective(samples, seq_idx)
+            action_dists, new_actions, log_pi = algo._get_policy_output(
+                samples['observation'], seq_idx)
+            policy_loss = algo._actor_objective(
+                samples, new_actions, log_pi, seq_idx=seq_idx)
+            policy_loss += algo._caps_regularization_objective(
+                action_dists, samples, seq_idx)
+
+            qf1_weight = algo._qf1._output_layers[0][0].weight
+            qf2_weight = algo._qf2._output_layers[0][0].weight
+            policy_weight = algo.policy._module._shared_mean_log_std_network \
+                ._output_layers[2 * seq_idx][0].weight
+            hessians = (
+                weight_hessian(policy_loss, policy_weight),
+                weight_hessian(qf1_loss, qf1_weight),
+                weight_hessian(qf2_loss, qf2_weight),
+            )
+            scale = np.sqrt(max(int(normalization_count), 1))
+            features = tuple(model._feature / scale for model in models)
+            metrics = {}
+            for index, name in enumerate(('policy', 'qf1', 'qf2')):
+                metrics[name + '_zero_ratio'] = zero_ratios[index]
+                metrics[name + '_feature_rank'] = int(feature_rank(
+                    features[index], 1e-3))
+                metrics[name + '_hessian_rank'] = int(feature_rank(
+                    hessians[index], 1e-5))
+                metrics[name + '_weight_change'] = float(weight_deviation(
+                    current_states[name], previous_states[name]).cpu())
+            metrics['plasticity_sample_count'] = int(
+                samples['observation'].shape[0])
+            metrics['plasticity_rng_preserved'] = True
+            return metrics, current_states
+    finally:
+        algo.capture, algo.capture_update = capture, capture_update
+        _trim_activation_stats((algo.policy, algo._qf1, algo._qf2,
+                                algo._target_qf1, algo._target_qf2))
+
+
+class RecentTransitions:
+    """Keep the most recent transitions used by legacy plasticity metrics."""
+    def __init__(self, maxlen=10000):
+        self.maxlen = maxlen
+        self.clear()
+
+    def clear(self):
+        self.batches = deque()
+        self.length = 0
+
+    def append(self, batch):
+        self.batches.append({key: batch[key] for key in TRANSITION_KEYS})
+        self.length += len(batch['observation'])
+        while (self.batches and
+               self.length - len(self.batches[0]['observation']) >= self.maxlen):
+            self.length -= len(self.batches.popleft()['observation'])
+
+    def as_torch(self):
+        if not self.batches:
+            raise RuntimeError('no recent transitions available')
+        arrays = {key: np.concatenate([batch[key] for batch in self.batches])[-self.maxlen:]
+                  for key in TRANSITION_KEYS}
+        return as_torch_dict(arrays)
+
+
 class RecordedFT(Finetuning_SAC):
     """Read-only taps around the unmodified SAC objective and Adam update."""
     capture = False
@@ -160,27 +302,39 @@ class RecordedFT(Finetuning_SAC):
                                                                self._before_critic_parameters)]
 
 
-def build_algorithm(spec, seed, device='cuda'):
+def build_algorithm(spec, seed, device='cuda', use_wandb=False,
+                    hidden_sizes=(256, 256), bellman_probe=False,
+                    bellman_spectral_stats=False, bellman_probe_dir=None,
+                    log_name=None, task_names=None):
     set_gpu_mode(device == 'cuda', 0)
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    policy = TanhGaussianMLPPolicy(spec, n_tasks=2, hidden_sizes=(256, 256),
-                                  hidden_nonlinearity=nn.ReLU, no_stats=True)
+    policy = TanhGaussianMLPPolicy(spec, n_tasks=2, hidden_sizes=hidden_sizes,
+                                  hidden_nonlinearity=nn.ReLU, no_stats=False)
     # Same fresh output-head initialization across task positions. These remain
     # separate parameters, not tied heads; A never optimizes the unused B head.
     outputs = policy._module._shared_mean_log_std_network._output_layers
     for offset in (0, 1):
         outputs[2 + offset].load_state_dict(outputs[offset].state_dict())
-    q1 = ContinuousMLPQFunction(spec, hidden_sizes=(256, 256), hidden_nonlinearity=F.relu)
-    q2 = ContinuousMLPQFunction(spec, hidden_sizes=(256, 256), hidden_nonlinearity=F.relu)
+    q1 = ContinuousMLPQFunction(spec, hidden_sizes=hidden_sizes,
+                               hidden_nonlinearity=F.relu, no_stats=False)
+    q2 = ContinuousMLPQFunction(spec, hidden_sizes=hidden_sizes,
+                               hidden_nonlinearity=F.relu, no_stats=False)
     algorithm = RecordedFT(
         policy=policy, qf1=q1, qf2=q2, env_spec=spec, sampler=None,
         replay_buffer=PathBuffer(capacity_in_transitions=1000000),
         num_tasks=1, eval_env=[], gradient_steps_per_itr=500, seed=seed,
-        no_stats=True, use_wandb=False, bellman_probe=False,
-        bellman_spectral_stats=False, q_reset=False, policy_reset=False,
-        task_names=None, buffer_batch_size=64, policy_lr=3e-4, qf_lr=3e-4,
+        no_stats=False, use_wandb=use_wandb, bellman_probe=bellman_probe,
+        bellman_probe_size=1024, bellman_probe_interval=100000,
+        bellman_probe_targets=8, bellman_probe_ridge=1e-3,
+        bellman_probe_dir=bellman_probe_dir,
+        bellman_spectral_stats=bellman_spectral_stats,
+        bellman_spectral_anchor_size=64, bellman_spectral_fit_lr=3e-4,
+        bellman_spectral_task_steps=(10000, 50000, 100000, 500000,
+                                     1000000, 1500000),
+        log_name=log_name, q_reset=False, policy_reset=False,
+        task_names=task_names, buffer_batch_size=64, policy_lr=3e-4, qf_lr=3e-4,
         discount=.99, target_update_tau=.005, initial_log_entropy=0.)
     algorithm.to(torch.device(device))
     return algorithm
@@ -288,6 +442,7 @@ class Run:
         self.eval_interactions = 0
         self.eval_seconds = 0.
         self.record_seconds = 0.
+        self.plasticity_seconds = 0.
         self.episode = 0
         self.env = None
         self.eval_envs = []
@@ -295,6 +450,9 @@ class Run:
         self.window = None
         self.last_checkpoint = None
         self.train_losses = []
+        self.recent_transitions = RecentTransitions(maxlen=10000)
+        self.recent_returns = deque(maxlen=30)
+        self.plasticity_reference_states = None
         self.logs = {}
         self.manifest = dict(
             schema_version=1, method='FT', pair=args.pair, seed=args.seed, tasks=self.tasks,
@@ -315,6 +473,15 @@ class Run:
                           eval_policy='deterministic tanh Gaussian location, separate env/RNG',
                           evaluation_scope='current every interval including 0; all seen at task end',
                           full_checkpoint='task boundaries only; intermediate checkpoints are analysis snapshots',
+                          online_plasticity_interval_updates=1000,
+                          online_plasticity_metrics=(
+                              'zero_ratio', 'feature_rank', 'hessian_rank', 'weight_change'),
+                          bellman_probe=bool(args.bellman_probe),
+                          bellman_probe_interval_env_steps=100000,
+                          bellman_spectral_stats=bool(args.bellman_spectral_stats),
+                          bellman_spectral_task_env_steps=(
+                              10000, 50000, 100000, 500000, 1000000, 1500000),
+                          wandb_all_scalar_metrics=bool(args.wandb),
                           heavy_online_jacobian=False, recording=True,
                           fresh_reference_caveat='same initial weights/head and warmup; transferred backbone differs'))
         self.status('initializing')
@@ -366,7 +533,15 @@ class Run:
         assert np.all(env.action_space.low == -1) and np.all(env.action_space.high == 1)
         spec = EnvSpec(akro.from_gym(env.observation_space), akro.from_gym(env.action_space),
                        max_episode_length=500)
-        self.algo = build_algorithm(spec, self.args.seed, self.args.device)
+        self.algo = build_algorithm(
+            spec, self.args.seed, self.args.device,
+            use_wandb=self.args.wandb,
+            bellman_probe=self.args.bellman_probe,
+            bellman_spectral_stats=self.args.bellman_spectral_stats,
+            bellman_probe_dir=str(self.root / 'bellman_probe'),
+            log_name='online', task_names=self.tasks)
+        self.plasticity_reference_states = _network_state(
+            (self.algo.policy, self.algo._qf1, self.algo._qf2))
         self.manifest['initialization_hashes'] = {name: state_hash(model)
                                                 for name, model in zip(self.algo.networks_names, self.algo.networks)}
         atomic_torch(self.root / 'checkpoints' / 'initial_models.pt',
@@ -390,6 +565,7 @@ class Run:
         self.warmup = []
         self.reservoir = []
         self.reservoir_seen = 0
+        self.recent_transitions.clear()
         self.anchors = None
         name = self.tasks[position]
         self.sample_rng = np.random.RandomState(stable_seed(self.args.seed, name, 'episode-sampler'))
@@ -398,7 +574,8 @@ class Run:
         self.reservoir_rng = np.random.RandomState(stable_seed(self.args.seed, name, 'reservoir'))
         if position:
             parent = self.last_checkpoint
-            self.algo.task_change(position - 1)
+            boundary_probe = self.algo.task_change(position - 1)
+            self.record_bellman_probe(boundary_probe)
             self.log('boundary_events', dict(
                 event='A_to_B', parent_checkpoint=parent, actor='carried, select untouched B head',
                 online_critics='carried unchanged', critic_optimizers='carried Adam',
@@ -501,6 +678,8 @@ class Run:
                          average_return=float(np.mean([r['return_value'] for r in results])),
                          success_rate=float(np.mean([r['success_any'] for r in results])))
         self.log('eval_summary', aggregate)
+        if self.args.wandb:
+            wandb.log(wandb_payload('eval', aggregate))
         print('EVAL_DONE', json.dumps(aggregate), flush=True)
         self.eval_seconds += time.time() - start
 
@@ -544,13 +723,49 @@ class Run:
                         self.reservoir[index] = record
             self.obs = next_obs
             if terminal or truncated:
-                self.log('train_episodes', dict(**self.clocks(), episode=self.episode,
-                         instance=self.instance, reset_seed=self.reset_seed,
-                         return_value=self.ep_return, success_any=self.ep_success, length=self.ep_length))
+                episode_row = dict(**self.clocks(), episode=self.episode,
+                                   instance=self.instance, reset_seed=self.reset_seed,
+                                   return_value=self.ep_return,
+                                   success_any=self.ep_success, length=self.ep_length)
+                self.log('train_episodes', episode_row)
+                self.recent_returns.append(self.ep_return)
                 self.episode += 1
                 self.ep_length = self.args.episode_length  # reset before next action, not before boundary snapshot
         batch = stack_records(records)
-        self.algo.replay_buffer.add_path({key: batch[key] for key in TRANSITION_KEYS})
+        self.recent_transitions.append(batch)
+        replay_path = {key: batch[key] for key in TRANSITION_KEYS}
+        self.algo.replay_buffer.add_path(replay_path)
+        if self.args.bellman_probe:
+            self.algo._append_bellman_probe(replay_path, self.task)
+        # This runner's canonical clock is actual environment interactions.
+        # Keep the legacy probe implementation on that same clock.
+        self.algo.global_step = self.global_env_step
+
+    def record_bellman_probe(self, metric):
+        if metric is None:
+            return
+        row = dict(metric)
+        row.update(global_env_step=int(metric['global_step']),
+                   task_env_step=int(metric['task_step']),
+                   train_task_position=int(metric['current_task']),
+                   train_task=metric['current_task_name'])
+        self.log('bellman_probe_metrics', row)
+        if self.args.wandb:
+            wandb.log(wandb_payload('bellman_probe', row))
+
+    def maybe_run_bellman_probe(self, endpoint=False):
+        if not self.args.bellman_probe or endpoint:
+            return
+        task_step = self.task_env_step
+        interval_due = task_step % self.algo._bellman_probe_interval == 0
+        spectral_due = (self.args.bellman_spectral_stats and
+                        self.algo._bellman_spectral_probe.should_run(
+                            'interval', task_step))
+        if interval_due or spectral_due:
+            metric = self.algo._run_bellman_probe('interval', self.task)
+            self.record_bellman_probe(metric)
+            if interval_due:
+                self.algo._save_bellman_probe_checkpoint(self.task, 'interval')
 
     def save_warmup(self):
         bank = stack_records(self.warmup)
@@ -577,14 +792,20 @@ class Run:
 
     def log_training(self):
         algo = self.algo
+        had_updates = bool(self.train_losses)
         row = dict(**self.clocks(), buffer_size=algo.replay_buffer.n_transitions_stored,
                    alpha=float(algo._log_alpha.detach().exp().cpu()), regularizer_loss=0.,
                    gradient_norms_last_update=getattr(algo, 'last_gradient_norms', None),
                    critic_update_norms_last_update=getattr(algo, 'last_update_norms', None),
-                   statistics_scope='loss means over updates since last log; Q/TD/reward summaries from last minibatch')
+                   reward_avg=(float(np.mean(self.recent_returns))
+                               if self.recent_returns else None),
+                   statistics_scope=('loss means over updates since last log; '
+                                     'Q/TD/reward summaries from last minibatch; '
+                                     'plasticity uses the most recent 10k transitions'))
         if self.train_losses:
             means = torch.stack(self.train_losses).mean(0).cpu().tolist()
             row.update(actor_loss=means[0], q1_loss=means[1], q2_loss=means[2],
+                       q_loss=means[1] + means[2],
                        aggregated_updates=len(self.train_losses))
             self.train_losses = []
             pred = algo.last_predictions
@@ -594,13 +815,31 @@ class Run:
             for key in ('q1', 'q2'):
                 row['last_minibatch'][key + '_td'] = summary_values(torch.as_tensor(
                     pred[key].reshape(-1) - pred['target'].reshape(-1)))
+        if had_updates:
+            start = time.time()
+            plasticity, self.plasticity_reference_states = compute_plasticity_metrics(
+                algo, self.recent_transitions.as_torch(), self.task,
+                self.plasticity_reference_states,
+                normalization_count=self.recent_transitions.maxlen)
+            self.plasticity_seconds += time.time() - start
+            row.update(plasticity)
+        row['speed_it_s'] = (self.global_updates /
+                             max(time.time() - self.start_time, 1e-9))
         self.log('train_metrics', row)
-        self.log('resource_metrics', dict(**self.clocks(), wall_seconds=time.time()-self.start_time,
-                 eval_interactions=self.eval_interactions, eval_seconds=self.eval_seconds,
-                 checkpoint_seconds=self.record_seconds,
-                 cuda_peak_allocated_bytes=torch.cuda.max_memory_allocated() if self.args.device == 'cuda' else 0))
+        resource_row = dict(
+            **self.clocks(), wall_seconds=time.time()-self.start_time,
+            eval_interactions=self.eval_interactions, eval_seconds=self.eval_seconds,
+            checkpoint_seconds=self.record_seconds,
+            plasticity_seconds=self.plasticity_seconds,
+            cuda_peak_allocated_bytes=(torch.cuda.max_memory_allocated()
+                                       if self.args.device == 'cuda' else 0))
+        self.log('resource_metrics', resource_row)
+        if self.args.wandb:
+            metrics = wandb_payload('train', row)
+            metrics.update(wandb_payload('resource', resource_row))
+            wandb.log(metrics)
         self.status('running')
-        if self.task_env_step % 10000 == 0:
+        if self.task_env_step % 1000 == 0:
             print('PROGRESS', json.dumps(row), flush=True)
 
     def train(self):
@@ -613,6 +852,7 @@ class Run:
                     self.log_training()
             self.save_warmup()
             self.save_checkpoint()
+            self.maybe_run_bellman_probe()
             while self.task_env_step < self.args.steps_per_task:
                 if task == 1 and self.task_env_step in self.args.window_starts:
                     assert self.window is None
@@ -629,13 +869,14 @@ class Run:
                     algo._update_targets()
                     self.task_updates += 1
                     self.global_updates += 1
-                    algo.global_step = self.global_updates
+                    algo.global_step = self.global_env_step
                     self.train_losses.append(torch.stack([loss.detach() for loss in losses]))
                     if self.window is not None and self.window.after_update():
                         self.window = None
                 if self.task_env_step % 1000 == 0 or self.task_env_step == self.args.steps_per_task:
                     self.log_training()
                 endpoint = self.task_env_step == self.args.steps_per_task
+                self.maybe_run_bellman_probe(endpoint=endpoint)
                 if self.task_env_step in self.args.snapshot_steps or endpoint:
                     self.save_checkpoint(full=endpoint)
                     if self.reservoir:
@@ -650,6 +891,10 @@ class Run:
             assert self.task_env_step == self.args.steps_per_task
             assert self.task_updates == self.args.steps_per_task-self.args.warmup_steps
         assert self.window is None
+        if self.args.bellman_probe:
+            final_probe = self.algo._run_bellman_probe('final', self.task)
+            self.record_bellman_probe(final_probe)
+            self.algo._save_bellman_probe_checkpoint(self.task, 'final')
         self.status('completed', finished_at=time.strftime('%Y-%m-%dT%H:%M:%S%z'))
         print('COMPLETED', self.clocks(), flush=True)
 
@@ -670,6 +915,13 @@ def parse_args(argv=None):
     parser.add_argument('--window-updates', type=int, default=1000)
     parser.add_argument('--window-starts', type=int, nargs='*', default=[10000, 100000, 500000, 1000000])
     parser.add_argument('--snapshot-steps', type=int, nargs='*', default=[50000, 100000, 500000, 1000000])
+    parser.add_argument('--wandb', type=str2bool, default=True,
+                        help='Enable W&B logging (default: true)')
+    parser.add_argument('--wandb-project', default='Reset-Distill')
+    parser.add_argument('--bellman-probe', type=str2bool, default=True,
+                        help='Enable Bellman feature/demand probes (default: true)')
+    parser.add_argument('--bellman-spectral-stats', type=str2bool, default=True,
+                        help='Enable scheduled Bellman spectral statistics (default: true)')
     parser.add_argument('--smoke', action='store_true')
     args = parser.parse_args(argv)
     assert args.steps_per_task > args.warmup_steps > 0
@@ -677,6 +929,7 @@ def parse_args(argv=None):
     assert args.steps_per_task % args.collect_steps == 0
     assert args.eval_interval % args.collect_steps == 0
     assert args.warmup_steps >= 2 * args.episode_length
+    assert not args.bellman_spectral_stats or args.bellman_probe
     assert 1 <= args.eval_episodes <= 50
     assert all(x >= args.warmup_steps and x+args.window_updates <= args.steps_per_task
                and x % args.collect_steps == 0 for x in args.window_starts)
@@ -692,7 +945,21 @@ def main():
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
     run = Run(args)
+    wandb_run = None
     try:
+        if args.wandb:
+            wandb.login()
+            wandb_run = wandb.init(
+                name='{}_ft_s{}'.format(args.pair, args.seed),
+                config=vars(args), project=args.wandb_project,
+                group=run.root.parent.parent.name,
+                job_type='FT', dir=str(run.root))
+            wandb.define_metric('clock/global_env_step')
+            for namespace in ('train/*', 'eval/*', 'resource/*'):
+                wandb.define_metric(
+                    namespace, step_metric='clock/global_env_step')
+            wandb.define_metric(
+                'bellman_probe/*', step_metric='clock/global_env_step')
         run.train()
     except BaseException:
         run.status('failed', error=traceback.format_exc())
@@ -700,6 +967,8 @@ def main():
     finally:
         for handle in run.logs.values():
             handle.close()
+        if wandb_run is not None:
+            wandb.finish()
 
 
 if __name__ == '__main__':

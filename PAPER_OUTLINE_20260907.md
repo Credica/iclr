@@ -9,12 +9,12 @@
 | 项目 | 当前决定 |
 |---|---|
 | 主实验 | F1、F2、F3、D-W6、D-C4 |
-| 主实验方法 | FT、Reset、EWC、FAME、Spectral regularization、R&D、Clip（ours），共 7 种 |
+| 主实验方法 | FT、Reset、EWC、P&C、Spectral regularization、ReDo、R&D、Clip（ours），共 8 种 |
 | Rethink | 原六任务池的完整 6×6 矩阵、六个深入分析方向、64 状态 MRP |
 | Rethink 方法 | 仅 FT、Reset、Clip（ours）；不追加其他在线方法或大规模消融 |
 | 训练预算 | 所有 RL 任务均为 1,500,000 实际环境交互步，包含 warm-up；源任务 A 和目标任务 B 各 1.5M |
 | 随机种子 | 所有正式 RL 运行仅 1、2、3；不再安排其他开发或补充训练 seeds |
-| 评估 | 每 50k 环境步评估当前任务 50 episodes；每任务结束评估所有已见任务各 50 episodes；不评估未来任务 |
+| 评估 | 每 10k 环境步评估 50 episodes；每任务结束评估所有已见任务各 50 episodes；不评估未来任务 |
 | 统计 | 3 seeds 均值 ± 样本标准差，提供全部 seed 曲线与配对差；不把 episodes/tasks/checkpoints 当额外独立 seeds |
 
 PT-Clip 原先只是 post-transfer clip 的工作缩写，意思是“从第二个任务开始 clip”，不是另外一种算法。现在正文和图表统一写 **Clip（ours，第二任务起）**。
@@ -23,7 +23,7 @@ PT-Clip 原先只是 post-transfer clip 的工作缩写，意思是“从第二�
 
 ### 1.1 五条任务序列
 
-Meta-World 名称统一补 `-v2`。F1–F3 沿用 FAME 使用的三条公开顺序，但本研究改为 1.5M/task、3 seeds，属于重新运行的统一协议，不称原论文严格复现。[FAME 任务设置](https://arxiv.org/html/2603.00903v1#A7.SS1)。
+Meta-World 名称统一补 `-v2`。F1–F3 仍沿用此前从 FAME 引用的三条公开顺序，但 FAME 不再是本研究 baseline；本研究改为 1.5M/task、3 seeds，属于重新运行的统一协议，不称该论文的严格复现。[任务顺序来源](https://arxiv.org/html/2603.00903v1#A7.SS1)。
 
 | ID | 完整顺序 | 单条流训练预算 |
 |---|---|---:|
@@ -37,23 +37,24 @@ D-W6/D-C4 是本研究固定的 DMC 持续任务顺序。H8/E8/CW20/ABC/RPP 不�
 
 统一主干：Meta-World 使用 2×256 ReLU SAC，DMC 使用 2×1024 SAC；actor 按任务位置分配 head，critic 共享。DMC 第二轮分配新的 occurrence head，不复用第一轮 head，因此重访指标解释为“共享 backbone 下同任务重新学习”，不是旧完整策略直接恢复；所有方法采用相同任务/head 语义并记录其适配。Meta-World 每个 task/seed 固定 50 个训练实例与独立的 50 个评估实例，各方法共享列表；训练按 episode 采样，评估固定实例与 reset seeds。本轮不强制 200-episode 终点评估；多实例 sampler 尚待实现验证。DMC 对每个任务固定 50 个评估 reset seeds。
 
-### 1.2 七种方法的定义
+### 1.2 八种方法的定义
 
 | 图表名称 | 本稿采用的定义 | 当前代码状态 |
 |---|---|---|
 | FT | 普通 SAC 连续微调 | 已有 `--cl_method finetuning` |
 | Reset | 沿用前文讨论的 critic-only Q-reset，actor 保留。正式方案重置双 Q、target Q 和对应 critic Adam 状态 | 现有 `--q_reset True` 只恢复初始化 Q 权重并同步 target，保留 Adam；须补齐 optimizer reset，不能混称同一实现 |
 | EWC | 原版 EWC，不加 clip；当前实现正则 actor | 已有 `--cl_method ewc`；需记录 Fisher、正则范围和系数 |
-| FAME | 单一原版 FAME-KL，不加 clip，不跑 WD 或集成变体 | 当前仓库没有 FAME 实现，需接入 |
-| Spectral regularization | 以已有谱正则方法为 baseline；SAC 移植的模块、正则公式及系数要记录，不以 hard clip 冒充 | 当前只有 PPO value regularizer，没有可直接用的 SAC baseline 开关 |
-| R&D | 完整 reset-and-distill，包括本任务 teacher 与部署 student | 已有 `--cl_method rnd`；teacher/data 管线及 DMC 接口需校验 |
+| P&C | Progress & Compress：active column 学习当前任务，再蒸馏到 knowledge base；compression 用 EWC 保护旧知识，不加 Clip | 正式配置固定 `use_pandc_bc=False, reset_column=True, reset_adaptor=True`；异构 DMC-style spec SAC 更新 smoke 已通过 |
+| Spectral regularization | ICLR 2025 的 k=2 layer spectral regularizer；actor 与双 online critic 系数均为 1e-4；多 head actor 只作用共享层与当前 mean/log-std heads，不改未激活 heads；不以 hard clip 冒充 | 已实现 `--cl_method spectral`，使用不消耗训练 RNG 的单步 power iteration；需完成统一协议 smoke test |
+| ReDo | Recycling Dormant Neurons：每 1k task-local 环境步按归一化平均绝对激活和固定 tau=0.1 回收；重采样 incoming、清零 outgoing；覆盖 actor 与双 critic | 已实现受影响 Adam moments 清理、双 target Q 同步与事件记录；固定配置，不做阈值/频率扫描 |
+| R&D | 完整 reset-and-distill，包括本任务 teacher 与部署 student | 双机 staged queue 先生成/复用相同 seed、1.5M teacher model+rollout；student 使用显式 artifact root；DMC 异构输入/head 映射已有单元测试 |
 | Clip（ours） | 第二任务起的 critic 双侧谱裁剪；具体定义见 §4.1 | 当前只支持部分 Meta-World 路径，缺 DMC/分支/统一诊断兼容 |
 
-FAME-KL 的选择依据是官方 MetaWorld 示例命令的 `--method buffer` 及其方法映射；不是说原文只有这一变体，也不是参数解析器的唯一默认。[FAME 官方示例](https://github.com/datake/FAME#environment-3-metaworld)。
+P&C 主实验固定使用论文的 EWC compression 路径，不使用仓库可选的 BC compression 变体。每次完成 compression 后重置 active column 及 adaptor；knowledge base、Fisher、compression optimizer 和已见任务计数都属于必须保存的方法状态。[P&C 原论文](https://proceedings.mlr.press/v80/schwarz18a.html)。
 
 Reset 在这里不是 actor+critic 全重置，也不是 R&D。权重+Adam 的正式定义沿用上一版计划；本轮不新增一个 weights-only 训练组，旧 weights-only 结果仅作为历史结果标注。
 
-所有方法在五条流上运行 seeds 1/2/3，即 105 个主序列配置。每方法每任务 1.5M 的主实验名义配额共 1.26B 环境交互，其中包含 R&D 对应的教师训练配额，不再重复加算一份教师预算。R&D 的学生是离线蒸馏，不虚构额外的 student 在线 1.5M 曲线；教师也只训练 1.5M，不读取旧 3M 教师充当同预算结果。配置严格相同的单任务教师可以缓存复用，但账本同时列名义与实际成本。FAME 的选择 warm-up 包含在对应任务的 1.5M 内；额外 buffer 收集、评估、distillation/meta/probe 更新分别记账，不声称不同方法计算量相同。
+所有方法在五条流上运行 seeds 1/2/3，即 120 个主序列配置。每方法每任务 1.5M 的主实验名义配额共 1.44B 环境交互，其中包含 R&D 对应的教师训练配额，不再重复加算一份教师预算。R&D 的学生是离线蒸馏，不虚构额外的 student 在线 1.5M 曲线；教师也只训练 1.5M，不读取旧 3M 教师充当同预算结果。配置严格相同的单任务教师可以缓存复用，但账本同时列名义与实际成本。P&C 的 compression 不计作环境交互，但必须单独记录其梯度更新数、样本读取量和墙钟；ReDo 的神经元统计与 recycling 事件单独记账；额外 buffer 收集、评估、distillation/compression/probe 更新分别记账，不声称不同方法计算量相同。
 
 ### 1.3 主表直接填数
 
@@ -61,15 +62,16 @@ Meta-World 获取指标：每任务 success-AUC = 1.5M⁻¹∫ success(t)dt，�
 
 **Table 1. Acquisition and retention on Meta-World.** 每格为获取 success-AUC / 最终已见任务平均 success，分别报告均值±SD。
 
-获取使用对应流程的当前在线 learner：R&D 为 teacher，FAME 为 fast learner；最终保留使用部署 student/meta learner。两类模型身份直接标在表注与图例，并另外保存部署模型在新任务上的表现，不能把二者拼成单个策略的学习曲线。
+获取使用对应流程的当前在线 learner：R&D 为 teacher，P&C 为 active column；最终保留使用部署 student，P&C 对旧任务使用 knowledge base、对当前任务使用 active column。模型身份直接标在表注与图例，不能把不同网络拼成一个虚构 agent。
 
 | Method | F1 | F2 | F3 |
 |---|---|---|---|
 | FT | -- | -- | -- |
 | Reset | -- | -- | -- |
 | EWC | -- | -- | -- |
-| FAME | -- | -- | -- |
+| P&C | -- | -- | -- |
 | Spectral regularization | -- | -- | -- |
+| ReDo | -- | -- | -- |
 | R&D | -- | -- | -- |
 | Clip（ours） | -- | -- | -- |
 
@@ -80,8 +82,9 @@ Meta-World 获取指标：每任务 success-AUC = 1.5M⁻¹∫ success(t)dt，�
 | FT | -- | -- |
 | Reset | -- | -- |
 | EWC | -- | -- |
-| FAME | -- | -- |
+| P&C | -- | -- |
 | Spectral regularization | -- | -- |
+| ReDo | -- | -- |
 | R&D | -- | -- |
 | Clip（ours） | -- | -- |
 
@@ -99,7 +102,7 @@ D-W6 首次获取用位置 2–3，重访用 4–6；D-C4 首次获取用位置 
 
 Fresh 参照直接复用六个源任务“从初始化学习 1.5M”的曲线；匹配网络/head 初始化、环境实例、warm-up 和预算后，才可作为相应 B 的 fresh。它不是第四种算法，也不新增独立 RL 训练。不能只凭相同 seed 假定初始化相同。
 
-矩阵预算为 18 个源预训练 ×1.5M + 324 个目标分支 ×1.5M = 513M。六个深入方向属于该矩阵，不再重复运行。主实验和矩阵的名义配额合计 1.773B，已含 R&D 名义教师训练份额，但不含额外数据收集、评估与离线计算；缓存复用后的实际成本另报，时间按实际吞吐估计。
+矩阵预算为 18 个源预训练 ×1.5M + 324 个目标分支 ×1.5M = 513M。六个深入方向属于该矩阵，不再重复运行。主实验和矩阵的名义配额合计 1.953B，已含 R&D 名义教师训练份额，但不含额外数据收集、评估与离线计算；缓存复用后的实际成本另报，时间按实际吞吐估计。
 
 ### 2.2 四组机制实验
 
@@ -112,7 +115,7 @@ Fresh 参照直接复用六个源任务“从初始化学习 1.5M”的曲线；
 
 R3 的冻结-target探针共用输入、target 或初始 correction、更新预算和批次顺序；统一 GD 用于理论校准，fresh/carried Adam 用于优化器敏感性分析。这些是离线测量条件，不是新的在线 baseline。
 
-不再执行上一版 actor-only、norm-only、随机扰动、from-A clip、阈值扫描、BRO、ReDo、Muon 等额外在线组。由此相应收窄结论：不能独立声称 critic 是唯一原因、第二任务起优于全程 clip、默认阈值最优，或已经排除全部探索/范数/optimizer 替代解释。
+不再执行上一版 actor-only、norm-only、随机扰动、from-A clip、阈值扫描、BRO、Muon 等额外在线组。ReDo 仅作为固定配置 baseline，不新增阈值或频率扫描。由此相应收窄结论：不能独立声称 critic 是唯一原因、第二任务起优于全程 clip、默认阈值最优，或已经排除全部探索/范数/optimizer 替代解释。
 
 **Table 3. Paired mechanism results on the six fixed transfer directions.** 各单元分别汇总三 seeds，不把六个方向当成六个独立训练 seeds；记录缺失不得填 0。
 
@@ -185,18 +188,18 @@ $$E_0-E_c=\underbrace{\|T_0e\|^2-\|T_ce\|^2}_{G_{\rm geom}}+2\langle T_ce,T_cj_c
 | 正文章节 | 要写清的内容 | 固定图表/结果填空 |
 |---|---|---|
 | 1 Introduction | 负迁移问题；Bellman-demand 视角；Q/K 分离；简单干预；三项贡献 | 填一个矩阵现象、一个机制发现、一个主实验结果 |
-| 2 Related Work and Preliminaries | CRL 与 R&D/FAME/EWC；谱正则与 SingularClip；SAC/Bellman/K 定义 | 明确组件来源与本文场景增量 |
+| 2 Related Work and Preliminaries | CRL 与 R&D/P&C/EWC；谱正则与 SingularClip；SAC/Bellman/K 定义 | 明确组件来源与本文场景增量 |
 | 3.1 Source-dependent transfer | 完整 6×6、三方法配对；critic 干预可改变哪些现象 | Fig. 1：FT−fresh、Reset−FT、Clip−FT 三张矩阵；填变化与例外 |
 | 3.2 Bellman-demand theory | 命题 1、慢方向需求与传播；精确 MRP | Fig. 2a–b：理论/数值及同谱不同需求结果 |
 | 3.3 Real-critic evidence | 六方向同 correction/同 target、共同动态 target 流 | Fig. 2c–d：拟合与残差滞留；填相对 TD/rank/单步诊断的增量 |
 | 4 Method and intervention theory | Algorithm 1：Clip（ours）；命题 2；两层机制例子 | 填实现说明，不填未经验证的普遍改善结论 |
-| 5.1 Setup | 五条序列、七方法、1.5M、三 seeds、50 eval、资源与统计 | 固定协议；说明与引用论文原协议的差别 |
+| 5.1 Setup | 五条序列、八方法、1.5M、三 seeds、50 eval、资源与统计 | 固定协议；说明与引用论文原协议的差别 |
 | 5.2 Main results | F1–F3 获取与保留，D-W/D-C 首次/重访与保留 | Tables 1–2；Fig. 3 五个序列的主学习曲线 |
 | 5.3 Mechanism-to-performance link | R4：同源分支的几何/函数/拟合变化及后续 B 获取 | Table 3；Fig. 4：Q-jump、共同需求拟合、后续 AUC 的配对关系 |
 | 6 Discussion and Limitations | 小样本统计、局部理论、缺少额外因子对照、方法不利条件与成本 | 填真实边界，不把相关性写成排除所有替代解释 |
 | 7 Conclusion | 回答重新理解了什么、干预有效到什么范围 | 一段；不新增主张 |
 
-Fig. 3 必须覆盖全部五条流，不挑最好看的序列；获取曲线图例明确 R&D teacher / FAME fast，student/meta 的部署表现另列，DMC Table 2 采用相同角色说明。完整七方法曲线提供附录。摘要最后按问题—分析—验证—实测效果—边界五句填写。
+Fig. 3 必须覆盖全部五条流，不挑最好看的序列；获取曲线图例明确 R&D teacher / P&C active column，student/knowledge base 的部署表现另列，DMC Table 2 采用相同角色说明。完整八方法曲线提供附录。摘要最后按问题—分析—验证—实测效果—边界五句填写。
 
 附录仅包括：A 协议与运行资源；B 完整证明与 MRP；C 五条流全部 seeds/逐任务曲线；D 完整 6×6 与六方向离线诊断；E 数据字典、实现审计和复现检查。上一版额外 baseline/超参数扫描不再保留为“必跑附录”。
 
@@ -209,19 +212,19 @@ Fig. 3 必须覆盖全部五条流，不挑最好看的序列；获取曲线图�
 | 当前真实开关 | 本轮建议 | 已有作用与限制 |
 |---|---|---|
 | `--num_evaluation_episodes 50` | 主实验/rethink 都开 50 | 每个被评估任务 50 episodes；不是全序列总共 50 |
-| `--num_evaluation_steps 50000` | 期望 50k 评估间隔；仅当前任务调度待实现 | 现有开关只改采样 epoch 频率，仍评估全部任务；需显式 env 计数和 current/seen 过滤，不能把日志 global_step 当环境步 |
-| `--no_stats True` | 两类实验都保持 True | False 会每 1000 critic updates 计算额外 Hessian/rank 等，成本高且部分操作消耗训练 RNG；不等于关闭普通 loss/eval 日志 |
-| `--wandb False` | 本地原始文件为准；W&B 可选 | False 仍有本地 results.pkl；是否上传不影响必须落盘的数据 |
+| `--num_evaluation_steps 10000` | 主 baseline 每 10k 环境步评估 | Hessian 在该采样点最后一次优化后计算，随后以同一参数状态评估 |
+| `--no_stats False` | 主 baseline 与单任务 teachers 打开 | zero ratio 每 1k；feature rank/weight change 和 Hessian rank 分别每 10k；诊断后恢复训练 RNG |
+| `--wandb True`（默认） | 本地原始文件仍为权威记录；W&B 用于在线监控与汇总 | 密钥只存机器本地，不写源码/manifest；显式 `--wandb false` 仍可离线运行，且不影响必须落盘的数据 |
 | `--bellman_probe True` | 当前 FT/Reset/EWC 可用于现成 probe/checkpoint；Clip 可用于 checkpoint/事件落盘 | Clip 的 buffer 收集和 metrics probe 被覆盖为空；R&D 训练循环未接入同一管线；不能称所有方法已经等价记录 |
 | `--bellman_probe_size 1024` | 保存输入的旧入口 | 收集每任务最早 1024 transitions，不是随机 replay reservoir；Clip 当前连这些也不收集 |
-| `--bellman_probe_interval N` | 必须注明单位，不能统一抄一个 N | 单位是 global critic updates；不等于 env steps，DMC 与 Meta-World 不同 |
+| `--bellman_probe_interval 100000` | 主 baseline 固定 | 单位为 task-local 环境步，另存 global/task critic updates |
 | `--bellman_probe_targets 8` | 旧指标记录参数 | 当前是确定性 sin 噪声形成的 8 组 directions，不能描述为独立 MC targets |
 | `--bellman_probe_ridge 0.001` | 固定记录 | 相对 ridge；分析必须同时保留原始尺度 |
 | `--bellman_probe_dir <run_root>` | 每个 run 唯一路径 | 目录再接 proc_name；不得覆盖旧结果 |
-| `--bellman_spectral_stats False` | 主实验与 rethink 的在线训练都保持 False | 完整谱/拟合改用统一离线分析，避免 Clip 不支持造成不对称；不是不做谱分析 |
+| `--bellman_spectral_stats True` | baseline 主序列打开 | 仅在 10k、50k、100k、500k、1M、1.5M 固定关键点触发 |
 | `--bellman_reference_dir <dir>` | 只在已有离线/探针接口适用时使用 | 固定 transitions，不固定 targets；不能靠它完成共同 target 流实验 |
 
-现有 FT/Reset 的旧式在线 full-J 探针还支持 `--bellman_spectral_anchor_size 64`、`--bellman_spectral_fit_lr 0.0003`、`--bellman_spectral_task_steps ...`，但最后一项单位为 task-local critic updates，Clip 入口明确拒绝该组合。本轮不把它作为正式在线开关方案。
+full-J 探针继续使用 `--bellman_spectral_anchor_size 64`、`--bellman_spectral_fit_lr 0.0003` 和固定 `--bellman_spectral_task_steps 10000 50000 100000 500000 1000000 1500000`；最后一项现在按 task-local 环境步解释。
 
 **没有现成的独立“逐 episode 导出”“完整 checkpoint”“保存共同 target 流”开关。** 下节是需要补齐的记录契约，不是虚构 CLI。只打开上表还不足以得到论文要求的全部数据。
 
@@ -232,13 +235,13 @@ Fig. 3 必须覆盖全部五条流，不挑最好看的序列；获取曲线图�
 | 拟保存文件 | 时机 | 必须字段 | 支持的图表/分析 |
 |---|---|---|---|
 | `run_manifest.json` | 启动与结束 | method、seed、task 顺序/位置/重复次数、代码与依赖版本、完整参数、初始化 hash、环境实例/评估 seeds、预算、实际事件调度、角色 teacher/student/fast/meta、完成状态 | 排除协议混淆、复现、资源表 |
-| `eval_episodes.jsonl` | 每 50k 当前任务；每任务结束全部已见任务 | global_env_step、task_env_step、global/task_critic_updates、train/eval_task_position、occurrence_id、policy_head/role、checkpoint_id、episode/instance/reset_seed、return、success_any、length、deterministic | AUC、return 与 success 分离、遗忘、首次/重访、50 episodes 分布 |
+| `eval_episodes.jsonl` | 每 10k 当前任务；每任务结束全部已见任务 | global_env_step、task_env_step、global/task_critic_updates、train/eval_task_position、occurrence_id、policy_head/role、checkpoint_id、episode/instance/reset_seed、return、success_any、length、deterministic | AUC、return 与 success 分离、遗忘、首次/重访、50 episodes 分布 |
 | `train_metrics.jsonl` | 每 1000 环境步汇总已有训练量 | 所有时钟、task、actor loss、Q1/Q2 TD loss、各正则 loss、alpha、reward/Q/target/TD 的均值与分位数、已有梯度和更新范数、buffer size | 学习停滞、Q/TD 尺度与优化状态 |
 | `boundary_events.jsonl` | 每次任务切换 | before/after task、Q/actor/optimizer/alpha/replay/target 的实际处理、初始化/父 checkpoint ID | Reset 与 Clip 的真实差异，任务边界对齐 |
 | `intervention_events.jsonl` | 每次 Clip 或 Reset 前后 | 实际 env/update 时刻、触发原因、逐层完整奇异值、参数位移、固定输入上 Q1/Q2 前后输出及 RMS/max jump、target sync、optimizer 处理 | Fig. 4、函数扰动、谱变化 |
 | `resource_metrics.jsonl` | 周期/结束 | train/eval/teacher/selection 交互数、online/distillation/meta/probe 更新数、训练/评估/记录墙钟、峰值显存、参数和缓存大小 | 不同算法成本与公平比较 |
 
-DMC 没有 success 时填 null/不适用，不填 0。Meta-World success 采用 episode 内任一时刻成功；training “Reward avg.” 与 evaluation average return 是不同字段。R&D 保存 student 的保留结果与 teacher 的获取曲线，FAME 保存 fast/meta 各自曲线，主表的部署策略必须注明，不能拼成一个虚构 agent 的成绩。
+DMC 没有 success 时填 null/不适用，不填 0。Meta-World success 采用 episode 内任一时刻成功；training “Reward avg.” 与 evaluation average return 是不同字段。R&D 保存 student 的保留结果与 teacher 的获取曲线；P&C 保存 active column 与 knowledge base 各自曲线，主表的部署策略必须注明，不能拼成一个虚构 agent 的成绩。
 
 训练标量尽量复用本来计算出的张量；不为日志额外采样 actor 动作、不额外做 Hessian。所有评估/诊断采用独立 RNG，或完整保存恢复 Python/NumPy/Torch/CUDA RNG；评估环境不得推进训练环境状态。
 
@@ -247,7 +250,7 @@ DMC 没有 success 时填 null/不适用，不填 0。Meta-World success 采用 
 **共同轻量快照时刻（task-local 环境步）：**
 0（边界处理前/后分别标明）、10k（warm-up 后、首个梯度更新前）、50k、100k、500k、1M、1.5M。每次 Clip/Reset 另保存干预前后 critic 权重或足以重建二者的差分，并当场保存固定输入上的 Q-jump。相同点去重，不复制整份 replay。
 
-快照至少包含 actor、online/target 双 Q、alpha、架构/head 信息、所有显式时钟和父 checkpoint ID。EWC 另存 Fisher/参考参数；R&D/FAME 另存各 learner 状态。task0 和 task1 指零基位置时须写清。
+快照至少包含 actor、online/target 双 Q、alpha、架构/head 信息、所有显式时钟和父 checkpoint ID。EWC 另存 Fisher/参考参数；R&D 另存 teacher/student 状态；P&C 另存 active column、knowledge base、previous knowledge base、Fisher、adaptor 和 compression optimizer 状态；SpectralReg 另存 power-iteration 向量；ReDo 另存激活统计窗口、阈值、调度时钟、recycling masks/事件和 optimizer/target 处理。task0 和 task1 指零基位置时须写清。
 
 用于 carried-Adam 离线拟合的上述选定 probe 点，额外保存双 Q Adam moments、step、lr、参数映射及完整 optimizer 配置；只有模型权重不能重现 inherited optimizer。其他中途快照保持轻量，不保存整份 replay。
 
@@ -283,7 +286,7 @@ B 入口尚未收集新任务 anchors 时，先保存干预前后模型，再在
 | 1.5M 预算口径未统一 | `main_garage.py:85–106` 额外加 warm-up，`args.py:64` 的 exact_sac_task_budget 是 critic 更新预算；必须新增真实 env 计数并验证包含 warm-up 的每任务恰好 1.5M |
 | Clip 不支持 DMC/分支/full probe | `garage/algo_factory.py:31–40` 明确拒绝，`sac_singular_clip.py:108–112` 关闭 probe 收集；须适配，不能只改一个 launch flag |
 | Clip 正式调度与旧实现不同 | 当前仅 B 入口额外 clip、周期按 task-local critic updates；统一为本稿环境时钟与每个后续任务入口后写测试 |
-| Reset、FAME、谱正则、R&D 适配 | Reset 缺 Adam reset；FAME/SAC SpectralReg 缺实现；R&D 的 loader 含 Meta-World 命名依赖；DMC baselines 必须真实运行验证 |
+| Reset、P&C、谱正则、ReDo、R&D 适配 | Reset Adam reset、SAC SpectralReg、周期 ReDo 和 R&D staged teacher loader 已实现并有针对性单元测试；P&C 已完成异构 DMC-style spec 的真实 SAC 更新，R&D 已完成异构输入切片与目标 head teacher 映射测试；目标机器启动时仍保留常规短程预检 |
 | D-W 未注册 | `main_garage.py:40–42` 的 DMC 列表没有 walker；补任务定义后核对重复任务/head |
 | 评估对象与标识不合要求 | `mtsac.py:340–360` 当前遍历包括未来在内的全部任务，DMC 默认共用 Evaluation prefix；需 current/seen 调度及 task_position/occurrence_id |
 | 评估消耗训练 RNG | `stochastic_policy.py:112` 先 sample，rollout 才取 mean；增加 eval episodes 会改变随机流；需要 RNG 隔离并验证打开记录不改变训练更新 |

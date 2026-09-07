@@ -37,9 +37,12 @@ MT50_ENV_SEQS = [
     'stick-push-v2',                'sweep-into-v2',        'sweep-v2',             'window-close-v2',          'window-open-v2',           # 45 46 47 48 49
     ]
 
+# Keep display names aligned exactly with the indices consumed by
+# CLTaskSampler, which indexes dm_control.suite.ALL_TASKS directly.
 DMC_ENV_SEQS = [
-    'DMControl-ball_in_cup-catch', 'DMControl-cartpole-balance', 'DMControl-cartpole-swingup', 'DMControl-finger-turn_easy', 'DMControl-fish-upright', 'DMControl-point_mass-easy', 'DMControl-reacher-easy', 
-    ]
+    'DMControl-{}-{}'.format(domain, task)
+    for domain, task in suite.ALL_TASKS
+]
 
 # faucet-open (19) --> push (38) --> sweep (47) --> button-press-topdown (4) —> window-open (49) --> sweep-into (46) --> button-press-wall (7) --> push-wall (39)
 HARD_SEQ = [19, 38, 47, 4, 49, 46, 7, 39]
@@ -86,9 +89,12 @@ START_STEPS = 0
 _sac_collection_batch = 1000 if args.env_type == 'dm_control' else 500
 if args.rl_method == 'sac':
     START_STEPS = int(1e4)
-    if (args.dsr_v2 or args.bellman_geometry or args.bellman_response or
-            args.sac_optimizer == 'muon' or args.sac_singular_clip or
-            args.exact_sac_task_budget):
+    if args.exact_sac_task_budget:
+        # The replay warm-up is part of, not additional to, the formal
+        # per-task environment-interaction budget.
+        START_STEPS = 0
+    elif (args.dsr_v2 or args.bellman_geometry or args.bellman_response or
+          args.sac_optimizer == 'muon' or args.sac_singular_clip):
         # 预热样本收集后也执行一批 critic 更新；扣除这批对应的交互偏移，
         # 使 v2 和几何方法每个任务恰好得到 steps_per_task 次更新。
         START_STEPS -= _sac_collection_batch
@@ -178,7 +184,8 @@ trainer.train(n_epochs=epochs, batch_size=batch_size)
 
 log_name = make_log_name(env_seq, args) 
 
-if len(env_seq) == 1 and not args.bellman_probe:
+if (len(env_seq) == 1 and
+        (not args.bellman_probe or args.save_single_task_artifacts)):
     if (args.first_task is None) or (env_seq[0] == args.first_task):
         algo.save_models(log_name=log_name)
         if args.rl_method == 'sac':

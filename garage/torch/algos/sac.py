@@ -2,6 +2,7 @@
 from collections import deque
 import copy
 import json
+import random
 
 from dowel import tabular
 import numpy as np
@@ -22,6 +23,8 @@ from garage.torch.algos.sac_demand_aligned_reserve import (
 from garage.torch.algos.sac_dsr_v2 import (
     SACDSRV2, restore_branches as restore_dsr_v2_branches,
     zero_head_gradients, step_heads)
+from garage.torch.algos.spectral_regularization import (
+    LayerSpectralRegularizer)
 from garage.torch._functions import list_to_tensor, zero_optim_grads, weight_deviation, weight_hessian, feature_rank
 from garage.torch.q_functions.continuous_mlp_q_function import (
     PlasticityInjectionBranch)
@@ -34,6 +37,25 @@ import pickle
 from time import time
 
 # yapf: enable
+
+
+def _capture_training_rng_state():
+    state = {
+        'python': random.getstate(),
+        'numpy': np.random.get_state(),
+        'torch': torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state['cuda'] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_training_rng_state(state):
+    random.setstate(state['python'])
+    np.random.set_state(state['numpy'])
+    torch.set_rng_state(state['torch'])
+    if 'cuda' in state:
+        torch.cuda.set_rng_state_all(state['cuda'])
 
 def load_model(model, model_name, first_task, seed):
     # Load policy
@@ -214,7 +236,12 @@ class SAC(RLAlgorithm):
             crelu=False,
             wasserstein = 0, 
             ReDo = False, 
+            redo_interval=1000,
+            redo_tau=0.1,
             no_stats=False, 
+            scalar_log_interval=1000,
+            feature_stats_interval=10000,
+            hessian_stats_interval=10000,
             multi_input=False,
             bellman_probe=False,
             bellman_probe_size=1024,
@@ -261,7 +288,11 @@ class SAC(RLAlgorithm):
             dar_alignment_lr=1e-3,
             dar_task_indices=None,
             dsr_v2=False,
-            dsr_v2_kwargs=None):
+            dsr_v2_kwargs=None,
+            spectral_regularization=False,
+            spectral_actor_coef=1e-4,
+            spectral_critic_coef=1e-4,
+            spectral_power_iterations=1):
 
         self._qf1 = qf1
         self._qf2 = qf2
@@ -278,7 +309,17 @@ class SAC(RLAlgorithm):
         self._infer = infer
         self._wasserstein = (wasserstein > 0)
         self._ReDo = ReDo
+        self._redo_interval = int(redo_interval)
+        self._redo_tau = float(redo_tau)
+        if self._redo_interval < 1 or self._redo_tau < 0:
+            raise ValueError('ReDo interval must be positive and tau non-negative.')
         self._no_stats = no_stats
+        self._scalar_log_interval = int(scalar_log_interval)
+        self._feature_stats_interval = int(feature_stats_interval)
+        self._hessian_stats_interval = int(hessian_stats_interval)
+        if min(self._scalar_log_interval, self._feature_stats_interval,
+               self._hessian_stats_interval) < 1:
+            raise ValueError('Logging intervals must be positive environment-step counts.')
         self._multi_input = multi_input
         self._bellman_probe = bellman_probe
         self._bellman_probe_size = bellman_probe_size
@@ -331,6 +372,16 @@ class SAC(RLAlgorithm):
         self._dsr_v2 = SACDSRV2(
             num_tasks=len(task_names) if task_names else 1,
             **(dsr_v2_kwargs or {}))
+        self._spectral_regularization_enabled = bool(
+            spectral_regularization)
+        self._spectral_actor_coef = float(spectral_actor_coef)
+        self._spectral_critic_coef = float(spectral_critic_coef)
+        if self._spectral_actor_coef < 0 or self._spectral_critic_coef < 0:
+            raise ValueError('Spectral regularization coefficients must be non-negative.')
+        self._spectral_regularizer = (
+            LayerSpectralRegularizer(spectral_power_iterations)
+            if self._spectral_regularization_enabled else None)
+        self._spectral_regularization_last_stats = {}
         self._demand_aligned_reserve = SACDemandAlignedReserve(
             capacity_price=dar_capacity_price,
             hidden_dim=dar_hidden_dim,
@@ -400,6 +451,19 @@ class SAC(RLAlgorithm):
                     pbsr_run_dir, 'pbsr_config.json'), 'w') as config_file:
                 json.dump(pbsr_config, config_file, indent=2)
             print('PBSR_CONFIG', json.dumps(pbsr_config), flush=True)
+        if self._spectral_regularization_enabled:
+            spectral_config = {
+                'method': 'spectral_regularization',
+                'formula': 'sum_l[(sigma_max(W_l)^2-1)^2+||b_l||_2^4]',
+                'actor_coefficient': self._spectral_actor_coef,
+                'critic_coefficient': self._spectral_critic_coef,
+                'power_iterations': self._spectral_regularizer.power_iterations,
+                'regularized_networks': [
+                    'actor_shared_and_current_task_head',
+                    'online_qf1', 'online_qf2'],
+                'target_networks_regularized': False,
+            }
+            print('SPECTRAL_REG_CONFIG', json.dumps(spectral_config), flush=True)
         self._min_buffer_size = min_buffer_size
         self._steps_per_epoch = steps_per_epoch
         self._buffer_batch_size = buffer_batch_size
@@ -462,6 +526,12 @@ class SAC(RLAlgorithm):
         self.recent_trajectory = RecentTrajectory(maxlen=10000)
 
         self.global_step = 0
+        self.global_env_step = 0
+        self._task_env_start_step = 0
+        self._last_scalar_log_env_step = -1
+        self._last_bellman_probe_env_step = -1
+        self._last_spectral_probe_env_step = -1
+        self._last_redo_env_step = -1
         # self.global_step = -self._gradient_steps
         self.seq_idx = 0
         self.start_time = time()
@@ -473,6 +543,11 @@ class SAC(RLAlgorithm):
         self.results['Q loss'] = []
         self.results['Alpha'] = []
         self.results['Speed (it/s)'] = []
+        self.results['Environment speed (steps/s)'] = []
+        self.results['Global env step'] = []
+        self.results['Task env step'] = []
+        self.results['Global critic updates'] = []
+        self.results['ReDo events'] = []
         if self._pbsr_enabled:
             self.results['PBSR Qf1 TD loss'] = []
             self.results['PBSR Qf2 TD loss'] = []
@@ -885,6 +960,7 @@ class SAC(RLAlgorithm):
         last_return = None
         # 从 checkpoint 恢复时，吞吐分子只统计本次 train 调用新增的更新。
         speed_start_step = self.global_step
+        speed_start_env_step = self.global_env_step
         speed_start_time = time()
         for env in self._sampler._envs:
             env.reset()
@@ -926,6 +1002,7 @@ class SAC(RLAlgorithm):
                             trainer.step_itr, self.seq_idx, batch_size)
                 
                 path_returns = []
+                collected_env_steps = 0
                 for path in trainer.step_episode:
                     replay_path = dict(
                         observation=path['observations'],
@@ -940,137 +1017,230 @@ class SAC(RLAlgorithm):
                     if self._bellman_probe:
                         self._append_bellman_probe(replay_path, self.seq_idx)
                     path_returns.append(path['rewards'])
+                    collected_env_steps += len(path['rewards'])
                     self.recent_trajectory.append(path)
                 assert len(path_returns) == len(trainer.step_episode)
+                self.global_env_step += collected_env_steps
                 self.episode_rewards.append(np.mean(path_returns))
 
                 
 
-                for _ in range(self._gradient_steps):
+                for gradient_index in range(self._gradient_steps):
                     
                     policy_loss, qf1_loss, qf2_loss = self.train_once(self.seq_idx)
                     self.global_step += 1
-                    task_step = (
-                        self.global_step - self._bellman_probe_task_start_step)
+                    task_step = self.global_env_step - self._task_env_start_step
+                    redo_due = (
+                        self._ReDo and task_step > 0 and
+                        task_step % self._redo_interval == 0 and
+                        gradient_index == self._gradient_steps - 1 and
+                        self.global_env_step != self._last_redo_env_step)
+                    if redo_due:
+                        redo_event = self.ReDo(self.seq_idx)
+                        self._last_redo_env_step = self.global_env_step
+                        self.results['ReDo events'].append(redo_event)
+                        if self._use_wandb:
+                            wandb.log({
+                                'Global env step': self.global_env_step,
+                                'Task env step': task_step,
+                                'ReDo recycled policy neurons':
+                                    redo_event['policy_recycled'],
+                                'ReDo recycled Qf1 neurons':
+                                    redo_event['qf1_recycled'],
+                                'ReDo recycled Qf2 neurons':
+                                    redo_event['qf2_recycled'],
+                            })
                     interval_probe_due = (
-                        self.global_step % self._bellman_probe_interval == 0)
+                        task_step > 0 and
+                        task_step % self._bellman_probe_interval == 0 and
+                        gradient_index == self._gradient_steps - 1 and
+                        self.global_env_step != self._last_bellman_probe_env_step)
                     spectral_probe_due = (
                         self._bellman_spectral_stats_enabled and
+                        gradient_index == self._gradient_steps - 1 and
+                        self.global_env_step != self._last_spectral_probe_env_step and
                         self._bellman_spectral_probe.should_run(
                             'interval', task_step))
                     if (self._bellman_probe and
                             (interval_probe_due or spectral_probe_due)):
                         self._run_bellman_probe('interval', self.seq_idx)
+                        if spectral_probe_due:
+                            self._last_spectral_probe_env_step = self.global_env_step
                         if interval_probe_due:
+                            self._last_bellman_probe_env_step = self.global_env_step
                             self._save_bellman_probe_checkpoint(
                                 self.seq_idx, 'interval')
                     with torch.no_grad():
                         alpha = self._log_alpha.exp()
                     end_time = time()
                     
-                    if self.global_step % 1000 == 0:
+                    scalar_due = (
+                        task_step > 0 and
+                        task_step % self._scalar_log_interval == 0 and
+                        gradient_index == self._gradient_steps - 1 and
+                        self.global_env_step != self._last_scalar_log_env_step)
+                    if scalar_due:
+                        self._last_scalar_log_env_step = self.global_env_step
                         training_speed = ((self.global_step - speed_start_step) /
                                           max(end_time - speed_start_time, 1e-9))
+                        environment_speed = (
+                            (self.global_env_step - speed_start_env_step) /
+                            max(end_time - speed_start_time, 1e-9))
+                        reward_avg = (sum(self.episode_rewards) /
+                                      len(self.episode_rewards))
+                        wandb_metrics = {
+                            'Global env step': self.global_env_step,
+                            'Task env step': task_step,
+                            'Global critic updates': self.global_step,
+                            'Running avg. of episode return': reward_avg,
+                            'Policy loss': policy_loss.item(),
+                            'Q loss': (qf1_loss + qf2_loss).item(),
+                            'Alpha': alpha.item(),
+                            'Speed (it/s)': training_speed,
+                            'Environment speed (steps/s)': environment_speed,
+                        }
 
                         if self._no_stats == False:
 
                             # Dormant neurons
-                            policy_zero_cnt = sum(self.policy._stats['zero_ratio'][-1000:]) / 1000
-                            qf1_zero_cnt = sum(self._qf1._stats['zero_ratio'][-1000:]) / 1000
-                            qf2_zero_cnt = sum(self._qf2._stats['zero_ratio'][-1000:]) / 1000
+                            def recent_mean(values):
+                                window = list(values)[-1000:]
+                                return float(np.mean(window)) if window else float('nan')
 
+                            policy_zero_cnt = recent_mean(
+                                self.policy._stats['zero_ratio'])
+                            qf1_zero_cnt = recent_mean(
+                                self._qf1._stats['zero_ratio'])
+                            qf2_zero_cnt = recent_mean(
+                                self._qf2._stats['zero_ratio'])
+                            wandb_metrics.update({
+                                'Policy zero ratio': policy_zero_cnt,
+                                'Qf1 zero ratio': qf1_zero_cnt,
+                                'Qf2 zero ratio': qf2_zero_cnt,
+                            })
 
-                            # Feature rank, Hessian
-                            eps = 0.001 # eps = 0.01 in Lyle et al. (2022); tried but the feature rank of policy is too small(below 10)
+                            feature_due = (
+                                task_step % self._feature_stats_interval == 0)
+                            hessian_due = (
+                                task_step % self._hessian_stats_interval == 0)
+                            if feature_due or hessian_due:
+                                diagnostics_rng_state = (
+                                    _capture_training_rng_state())
+                                recent_obs = self.recent_trajectory.observation
+                                recent_samples = self.recent_trajectory.samples
 
-                            recent_obs = self.recent_trajectory.observation
-                            recent_samples = self.recent_trajectory.samples
-
-                            qf1_loss_hess, qf2_loss_hess = self._critic_objective(recent_samples, self.seq_idx)
-
-                            action_dists, new_actions, log_pi_new_actions = self._get_policy_output(recent_obs, self.seq_idx)
-
-                            policy_loss_hess = self._actor_objective(recent_samples, new_actions,
-                                                                log_pi_new_actions, seq_idx=self.seq_idx)
-                            policy_loss_hess += self._caps_regularization_objective(
-                                action_dists, recent_samples, self.seq_idx)
-                            
-                            qf1_last_weight = self._qf1._output_layers[0][0].weight
-                            qf2_last_weight = self._qf2._output_layers[0][0].weight
-                            policy_last_weight = self.policy._module._shared_mean_log_std_network._output_layers[2*self.seq_idx][0].weight
-                            
-                            qf1_hessian = weight_hessian(qf1_loss_hess, qf1_last_weight)
-                            qf2_hessian = weight_hessian(qf2_loss_hess, qf2_last_weight)
-                            policy_hessian = weight_hessian(policy_loss_hess, policy_last_weight)
-
-                            qf1_hessian_rank = feature_rank(qf1_hessian, 1e-5)
-                            qf2_hessian_rank = feature_rank(qf2_hessian, 1e-5)
-                            policy_hessian_rank = feature_rank(policy_hessian, 1e-5)
-
-                            print("policy / qf1 / qf2 hessian rank: ", policy_hessian_rank, qf1_hessian_rank, qf2_hessian_rank)
-
-
-                            policy_normalized_feature =  self.policy._feature / np.sqrt(self.recent_trajectory.maxlen)
-                            qf1_normalized_feature =  self._qf1._feature / np.sqrt(self.recent_trajectory.maxlen)
-                            qf2_normalized_feature =  self._qf2._feature / np.sqrt(self.recent_trajectory.maxlen)                        
-
-                            policy_feature_rank = feature_rank(policy_normalized_feature, eps)
-                            qf1_feature_rank = feature_rank(qf1_normalized_feature, eps)
-                            qf2_feature_rank = feature_rank(qf2_normalized_feature, eps)
-
-                            print("policy / qf1 / qf2 feature rank: ", policy_feature_rank, qf1_feature_rank, qf2_feature_rank)
-
-                            # Weight deviation
-                            policy_state_dict = copy.deepcopy(self.policy.state_dict())
-                            qf1_state_dict = copy.deepcopy(self._qf1.state_dict())
-                            qf2_state_dict = copy.deepcopy(self._qf2.state_dict())
-
-                            policy_dev = weight_deviation(policy_state_dict, self.recent_policy_state_dict)
-                            qf1_dev = weight_deviation(qf1_state_dict, self.recent_qf1_state_dict)
-                            qf2_dev = weight_deviation(qf2_state_dict, self.recent_qf2_state_dict)
-
-                            print("Policy / qf1 / qf2 weight deviation: ", policy_dev.item(), qf1_dev.item(), qf2_dev.item())
-
-                            self.recent_policy_state_dict = policy_state_dict
-                            self.recent_qf1_state_dict = qf1_state_dict
-                            self.recent_qf2_state_dict = qf2_state_dict
-
-                        if self._use_wandb:
-                            if self._no_stats == False:
-                                wandb.log({
-                                    'Running avg. of episode return': sum(self.episode_rewards) / len(self.episode_rewards),
-                                    'Policy loss': policy_loss.item(),
-                                    'Q loss': (qf1_loss + qf2_loss).item(),
-                                    'Alpha': alpha.item(),
-                                    'Speed (it/s)' : training_speed,
-                                    'Policy zero ratio': policy_zero_cnt,
-                                    'Qf1 zero ratio': qf1_zero_cnt,
-                                    'Qf2 zero ratio': qf2_zero_cnt,
-                                    'Policy feature rank': policy_feature_rank,
-                                    'Qf1 feature rank': qf1_feature_rank,
-                                    'Qf2 feature rank': qf2_feature_rank,
+                            if hessian_due:
+                                qf1_loss_hess, qf2_loss_hess = (
+                                    self._critic_objective(
+                                        recent_samples, self.seq_idx))
+                                action_dists, new_actions, log_pi_new_actions = (
+                                    self._get_policy_output(
+                                        recent_obs, self.seq_idx))
+                                policy_loss_hess = self._actor_objective(
+                                    recent_samples, new_actions,
+                                    log_pi_new_actions, seq_idx=self.seq_idx)
+                                policy_loss_hess += (
+                                    self._caps_regularization_objective(
+                                        action_dists, recent_samples,
+                                        self.seq_idx))
+                                qf1_last_weight = self._qf1._output_layers[0][0].weight
+                                qf2_last_weight = self._qf2._output_layers[0][0].weight
+                                policy_last_weight = self.policy._module._shared_mean_log_std_network._output_layers[2*self.seq_idx][0].weight
+                                qf1_hessian_rank = feature_rank(
+                                    weight_hessian(qf1_loss_hess,
+                                                   qf1_last_weight), 1e-5)
+                                qf2_hessian_rank = feature_rank(
+                                    weight_hessian(qf2_loss_hess,
+                                                   qf2_last_weight), 1e-5)
+                                policy_hessian_rank = feature_rank(
+                                    weight_hessian(policy_loss_hess,
+                                                   policy_last_weight), 1e-5)
+                                wandb_metrics.update({
                                     'Policy hessian rank': policy_hessian_rank,
                                     'Qf1 hessian rank': qf1_hessian_rank,
                                     'Qf2 hessian rank': qf2_hessian_rank,
+                                })
+                                self.results['Policy hessian rank'].append(
+                                    policy_hessian_rank)
+                                self.results['Qf1 hessian rank'].append(
+                                    qf1_hessian_rank)
+                                self.results['Qf2 hessian rank'].append(
+                                    qf2_hessian_rank)
+
+                            if feature_due:
+                                if not hessian_due:
+                                    with torch.no_grad():
+                                        self._critic_objective(
+                                            recent_samples, self.seq_idx)
+                                        self._get_policy_output(
+                                            recent_obs, self.seq_idx)
+                                eps = 0.001
+                                normalizer = np.sqrt(max(len(recent_obs), 1))
+                                policy_feature_rank = feature_rank(
+                                    self.policy._feature / normalizer, eps)
+                                qf1_feature_rank = feature_rank(
+                                    self._qf1._feature / normalizer, eps)
+                                qf2_feature_rank = feature_rank(
+                                    self._qf2._feature / normalizer, eps)
+
+                                policy_state_dict = copy.deepcopy(
+                                    self.policy.state_dict())
+                                qf1_state_dict = copy.deepcopy(
+                                    self._qf1.state_dict())
+                                qf2_state_dict = copy.deepcopy(
+                                    self._qf2.state_dict())
+                                policy_dev = weight_deviation(
+                                    policy_state_dict,
+                                    self.recent_policy_state_dict)
+                                qf1_dev = weight_deviation(
+                                    qf1_state_dict,
+                                    self.recent_qf1_state_dict)
+                                qf2_dev = weight_deviation(
+                                    qf2_state_dict,
+                                    self.recent_qf2_state_dict)
+                                self.recent_policy_state_dict = policy_state_dict
+                                self.recent_qf1_state_dict = qf1_state_dict
+                                self.recent_qf2_state_dict = qf2_state_dict
+                                wandb_metrics.update({
+                                    'Policy feature rank': policy_feature_rank,
+                                    'Qf1 feature rank': qf1_feature_rank,
+                                    'Qf2 feature rank': qf2_feature_rank,
                                     'Policy weight change': policy_dev.item(),
                                     'Qf1 weight change': qf1_dev.item(),
-                                    'Qf2 weight change': qf2_dev.item(),  
+                                    'Qf2 weight change': qf2_dev.item(),
                                 })
-                            else:
-                                wandb.log({
-                                    'Running avg. of episode return': sum(self.episode_rewards) / len(self.episode_rewards),
-                                    'Policy loss': policy_loss.item(),
-                                    'Q loss': (qf1_loss + qf2_loss).item(),
-                                    'Alpha': alpha.item(),
-                                    'Speed (it/s)' : training_speed
-                                })
+                                self.results['Policy feature rank'].append(
+                                    policy_feature_rank)
+                                self.results['Qf1 feature rank'].append(
+                                    qf1_feature_rank)
+                                self.results['Qf2 feature rank'].append(
+                                    qf2_feature_rank)
+                                self.results['Policy weight change'].append(
+                                    policy_dev.item())
+                                self.results['Qf1 weight change'].append(
+                                    qf1_dev.item())
+                                self.results['Qf2 weight change'].append(
+                                    qf2_dev.item())
+                            if feature_due or hessian_due:
+                                _restore_training_rng_state(
+                                    diagnostics_rng_state)
+
+                        if self._use_wandb:
+                            wandb.log(wandb_metrics)
 
 
-                        self.results['Running avg. of episode return'].append(sum(self.episode_rewards) / len(self.episode_rewards))
+                        self.results['Running avg. of episode return'].append(reward_avg)
                         self.results['Policy loss'].append(policy_loss.item())
                         self.results['Q loss'].append((qf1_loss + qf2_loss).item())
                         self.results['Alpha'].append(alpha.item())
                         self.results['Speed (it/s)'].append(training_speed)
+                        self.results['Environment speed (steps/s)'].append(
+                            environment_speed)
+                        self.results['Global env step'].append(
+                            self.global_env_step)
+                        self.results['Task env step'].append(task_step)
+                        self.results['Global critic updates'].append(
+                            self.global_step)
                         if self._pbsr_enabled:
                             pbsr_active = (
                                 self.seq_idx < self._pbsr_train_task_count and
@@ -1106,18 +1276,17 @@ class SAC(RLAlgorithm):
                             self.results['Policy zero ratio'].append(policy_zero_cnt)
                             self.results['Qf1 zero ratio'].append(qf1_zero_cnt)
                             self.results['Qf2 zero ratio'].append(qf2_zero_cnt)
-                            self.results['Policy feature rank'].append(policy_feature_rank)
-                            self.results['Qf1 feature rank'].append(qf1_feature_rank)
-                            self.results['Qf2 feature rank'].append(qf2_feature_rank)
-                            self.results['Policy hessian rank'].append(policy_hessian_rank)
-                            self.results['Qf1 hessian rank'].append(qf1_hessian_rank)
-                            self.results['Qf2 hessian rank'].append(qf2_hessian_rank)
-                            self.results['Policy weight change'].append(policy_dev.item())
-                            self.results['Qf1 weight change'].append(qf1_dev.item())
-                            self.results['Qf2 weight change'].append(qf2_dev.item())
                         
 
-                        print('STEP: {} '.format(self.global_step),'policy loss: {:.2f} '.format(policy_loss.item()), 'Q loss: {:.6f} '.format((qf1_loss + qf2_loss).item()), 'Alpha: {:.7f}'.format(alpha.item()), 'Reward avg.: {:.7f}'.format(sum(self.episode_rewards) / len(self.episode_rewards)), 'Speed: {:.1f} it/s'.format(training_speed))
+                        print('ENV_STEP: {} UPDATE: {} '.format(
+                            self.global_env_step, self.global_step),
+                            'policy loss: {:.2f} '.format(policy_loss.item()),
+                            'Q loss: {:.6f} '.format(
+                                (qf1_loss + qf2_loss).item()),
+                            'Alpha: {:.7f}'.format(alpha.item()),
+                            'Reward avg.: {:.7f}'.format(reward_avg),
+                            'Speed: {:.1f} env-steps/s'.format(
+                                environment_speed))
                 
                 next_task = getattr(self._sampler._envs[0], "cur_seq_idx")
                 # v2 的精确预算会到达最后一个环境的结束边界，最终评估仍属于末任务。
@@ -1134,7 +1303,11 @@ class SAC(RLAlgorithm):
                     self.seq_idx = getattr(self._sampler._envs[0], "cur_seq_idx")
                     print('Next task number =',self.seq_idx)
             
-            last_return = self._evaluate_policy(trainer.step_itr)
+            evaluation_rng_state = _capture_training_rng_state()
+            try:
+                last_return = self._evaluate_policy(trainer.step_itr)
+            finally:
+                _restore_training_rng_state(evaluation_rng_state)
             self.save_results()
             trainer.step_itr += 1
 
@@ -1243,13 +1416,19 @@ class SAC(RLAlgorithm):
             coverage = 1. - unexplained.square().sum() / demands.square().sum()
             stable_rank = feature_s.square().sum() / feature_s[0].square()
 
-        task_step = self.global_step - self._bellman_probe_task_start_step
+        task_step = self.global_env_step - self._task_env_start_step
+        task_critic_step = (
+            self.global_step - self._bellman_probe_task_start_step)
         metric = {
             'event': event,
             'global_step': self.global_step,
+            'global_env_step': self.global_env_step,
+            'global_critic_updates': self.global_step,
             'current_task': current_task_idx,
             'current_task_name': self._task_names[current_task_idx],
             'task_step': task_step,
+            'task_env_step': task_step,
+            'task_critic_updates': task_critic_step,
             'feature_rank_99': feature_rank,
             'feature_stable_rank': stable_rank.item(),
             'bellman_demand_rank_99': demand_rank,
@@ -1269,7 +1448,7 @@ class SAC(RLAlgorithm):
                 else alpha_values.reshape(()))
             metric.update(self._bellman_spectral_probe.run(
                 event=event,
-                global_step=self.global_step,
+                global_step=self.global_env_step,
                 task_step=task_step,
                 task_idx=current_task_idx,
                 task_name=self._task_names[current_task_idx],
@@ -1288,13 +1467,16 @@ class SAC(RLAlgorithm):
             key: value for key, value in metric.items()
             if key not in ('feature_singular_values', 'bellman_singular_values')
         }))
+        return metric
 
     def _save_bellman_probe_checkpoint(self, seq_idx, event):
         checkpoint_path = os.path.join(
             self._bellman_probe_checkpoint_dir,
-            '{}_task{}_step{}.pt'.format(event, seq_idx, self.global_step))
+            '{}_task{}_env{}_update{}.pt'.format(
+                event, seq_idx, self.global_env_step, self.global_step))
         torch.save({
             'global_step': self.global_step,
+            'global_env_step': self.global_env_step,
             'seq_idx': seq_idx,
             'policy': self.policy.state_dict(),
             'qf1': self._qf1.state_dict(),
@@ -1318,7 +1500,31 @@ class SAC(RLAlgorithm):
                      if hasattr(self, 'muon_checkpoint_state') else None),
             'singular_clip': (self.singular_clip_checkpoint_state()
                              if hasattr(self, 'singular_clip_checkpoint_state') else None),
+            'spectral_regularization': (
+                self.spectral_regularization_checkpoint_state()
+                if self._spectral_regularization_enabled else None),
         }, checkpoint_path)
+
+    def spectral_regularization_checkpoint_state(self):
+        """Return the method-specific state needed for exact continuation."""
+        if not self._spectral_regularization_enabled:
+            return None
+        return {
+            'actor_coefficient': self._spectral_actor_coef,
+            'critic_coefficient': self._spectral_critic_coef,
+            'regularizer': self._spectral_regularizer.state_dict(),
+            'last_stats': copy.deepcopy(
+                self._spectral_regularization_last_stats),
+        }
+
+    @staticmethod
+    def _spectral_actor_layer_is_active(name, seq_idx):
+        """Exclude inactive task heads from the current actor objective."""
+        marker = '_output_layers.'
+        if marker not in name:
+            return True
+        output_index = int(name.split(marker, 1)[1].split('.', 1)[0])
+        return output_index in (2 * int(seq_idx), 2 * int(seq_idx) + 1)
 
     def train_once(self, seq_idx, itr=None, paths=None):
         """Complete 1 training iteration of SAC.
@@ -1454,48 +1660,88 @@ class SAC(RLAlgorithm):
             loss += F.mse_loss(sorted, target_sorted)
         return self._wasserstein_lambda * loss
 
+    @staticmethod
+    def _zero_optimizer_mask(optimizer, parameter, row_mask=None,
+                             column_mask=None):
+        state = optimizer.state.get(parameter, {})
+        for value in state.values():
+            if not torch.is_tensor(value) or value.shape != parameter.shape:
+                continue
+            if row_mask is not None:
+                value[row_mask] = 0
+            if column_mask is not None:
+                value[:, column_mask] = 0
+
+    def _redo_network(self, network, optimizer):
+        features = getattr(network, '_features', None)
+        if not features or len(features) != len(network._layers):
+            return 0
+        masks = []
+        for feature in features:
+            detached = feature.detach().abs()
+            reduce_dims = tuple(range(detached.ndim - 1))
+            mean_activation = detached.mean(dim=reduce_dims)
+            score = mean_activation / mean_activation.mean().clamp_min(1e-9)
+            masks.append(score <= self._redo_tau)
+
+        recycled = 0
+        with torch.no_grad():
+            # First reinitialize every dormant unit's incoming parameters.
+            for layer_idx, (layer, mask) in enumerate(
+                    zip(network._layers, masks)):
+                if not bool(mask.any()):
+                    continue
+                recycled += int(mask.sum().item())
+                linear = layer[0]
+                fresh_weight = torch.empty_like(linear.weight)
+                network._hidden_w_init(fresh_weight)
+                linear.weight[mask] = fresh_weight[mask]
+                fresh_bias = torch.empty_like(linear.bias)
+                network._hidden_b_init(fresh_bias)
+                linear.bias[mask] = fresh_bias[mask]
+                self._zero_optimizer_mask(
+                    optimizer, linear.weight, row_mask=mask)
+                self._zero_optimizer_mask(
+                    optimizer, linear.bias, row_mask=mask)
+            # Then zero outgoing connections, after all incoming resets, so a
+            # deeper-layer reset cannot reintroduce a previous dormant unit.
+            for layer_idx, mask in enumerate(masks):
+                if not bool(mask.any()):
+                    continue
+                if layer_idx + 1 < len(network._layers):
+                    outgoing = network._layers[layer_idx + 1][0].weight
+                    outgoing[:, mask] = 0
+                    self._zero_optimizer_mask(
+                        optimizer, outgoing, column_mask=mask)
+                else:
+                    for output_layer in network._output_layers:
+                        outgoing = output_layer[0].weight
+                        outgoing[:, mask] = 0
+                        self._zero_optimizer_mask(
+                            optimizer, outgoing, column_mask=mask)
+        return recycled
+
     def ReDo(self, seq_idx):
-
-        # Layer만 생각할게 아니라, output layer도 생각해야한다.
-        policy_network = self.policy._module._shared_mean_log_std_network
-
-        random_policy_network = self.random_policy._module._shared_mean_log_std_network
-
-        network_list = [policy_network, self._qf1, self._qf2]
-        random_network_list = [random_policy_network, self._random_qf1, self._random_qf2]
-
-        for network_idx, (random_network, network) in enumerate(zip(random_network_list, network_list)):
-            random_layers = random_network._layers
-            layers = network._layers
-            pre_idx = -1
-            for idx, (random_layer, layer) in enumerate(zip(random_layers, layers)):
-                
-                with torch.no_grad():
-                    if pre_idx!=-1:
-                        pre_zero_idx = network._stats['zero_idx'][pre_idx]
-                        temp = 1 - pre_zero_idx.float()
-                        temp = temp.unsqueeze(0)
-                        layer[0].weight.data *= temp
-
-
-                    zero_idx = network._stats['zero_idx'][idx]
-                    mask = zero_idx.float().unsqueeze(-1)
-
-                    layer[0].weight.data = (1-mask)*layer[0].weight.data + mask*random_layer[0].weight.data
-                    mask = mask.squeeze()
-                    layer[0].bias.data = (1-mask)*layer[0].bias.data + mask*random_layer[0].bias.data
-
-                    pre_idx = idx
-            
-            
-            zero_idx = network._stats['zero_idx'][pre_idx]
-
-            if network_idx == 0:
-                next_seq_idx = seq_idx + 1
-                network._output_layers[2*next_seq_idx][0].weight.data[:, zero_idx] = 0
-                network._output_layers[2*next_seq_idx+1][0].weight.data[:, zero_idx] = 0
-            else:
-                network._output_layers[0][0].weight.data[:, zero_idx] = 0
+        """Recycle dormant actor/critic neurons using normalized activation."""
+        policy_network = (
+            self.policy._module._shared_mean_log_std_network)
+        event = {
+            'global_env_step': self.global_env_step,
+            'task_env_step': self.global_env_step - self._task_env_start_step,
+            'task_index': seq_idx,
+            'tau': self._redo_tau,
+            'interval': self._redo_interval,
+            'policy_recycled': self._redo_network(
+                policy_network, self._policy_optimizer),
+            'qf1_recycled': self._redo_network(
+                self._qf1, self._qf1_optimizer),
+            'qf2_recycled': self._redo_network(
+                self._qf2, self._qf2_optimizer),
+        }
+        self._target_qf1.load_state_dict(self._qf1.state_dict())
+        self._target_qf2.load_state_dict(self._qf2.state_dict())
+        print('REDO_EVENT', json.dumps(event), flush=True)
+        return event
 
 
     def _actor_objective(self, samples_data, new_actions, log_pi_new_actions, seq_idx=None):
@@ -1694,6 +1940,21 @@ class SAC(RLAlgorithm):
             qf1_loss += self.wasserstein_reg_loss(self._qf1, self._wasserstein_target_qf1)
             qf2_loss += self.wasserstein_reg_loss(self._qf2, self._wasserstein_target_qf2)
 
+        if self._spectral_regularization_enabled:
+            spectral_diagnostics_due = (
+                self._critic_optimizer_steps < 10 or
+                self._critic_optimizer_steps % 1000 == 0)
+            qf1_regularizer, qf1_spectral_stats = (
+                self._spectral_regularizer.loss(
+                    self._qf1, 'qf1', spectral_diagnostics_due))
+            qf2_regularizer, qf2_spectral_stats = (
+                self._spectral_regularizer.loss(
+                    self._qf2, 'qf2', spectral_diagnostics_due))
+            qf1_loss = (
+                qf1_loss + self._spectral_critic_coef * qf1_regularizer)
+            qf2_loss = (
+                qf2_loss + self._spectral_critic_coef * qf2_regularizer)
+
         pbsr_due = (
             self._pbsr_enabled and
             seq_idx < self._pbsr_train_task_count and
@@ -1771,6 +2032,24 @@ class SAC(RLAlgorithm):
         if self._wasserstein:
             policy_loss += self.wasserstein_reg_loss(self.policy, self._wasserstein_target_policy)
 
+        if self._spectral_regularization_enabled:
+            actor_regularizer, actor_spectral_stats = (
+                self._spectral_regularizer.loss(
+                    self.policy, 'actor', spectral_diagnostics_due,
+                    module_filter=lambda name, module:
+                    self._spectral_actor_layer_is_active(name, seq_idx)))
+            policy_loss = (
+                policy_loss + self._spectral_actor_coef * actor_regularizer)
+            if spectral_diagnostics_due:
+                self._spectral_regularization_last_stats = {
+                    'global_step': int(self.global_step),
+                    'critic_optimizer_step': int(self._critic_optimizer_steps),
+                    'task': int(seq_idx),
+                    'actor': actor_spectral_stats,
+                    'qf1': qf1_spectral_stats,
+                    'qf2': qf2_spectral_stats,
+                }
+
         zero_optim_grads(self._policy_optimizer)
         policy_loss.backward()
         self._policy_optimizer.step()
@@ -1833,14 +2112,13 @@ class SAC(RLAlgorithm):
             self._log_alpha = list_to_tensor([self._fixed_alpha]).log()
 
     def task_change(self, seq_idx):
+        bellman_probe_metric = None
         if self._bellman_probe:
-            self._run_bellman_probe('task_boundary', seq_idx)
+            bellman_probe_metric = self._run_bellman_probe(
+                'task_boundary', seq_idx)
             self._save_bellman_probe_checkpoint(seq_idx, 'task_boundary')
 
         self.on_task_start(seq_idx)
-
-        if self._ReDo and (seq_idx+1) < len(self._eval_env):
-            self.ReDo(seq_idx)
 
         self.replay_buffer.clear()
         self._critic_optimizer_steps = 0
@@ -1850,6 +2128,21 @@ class SAC(RLAlgorithm):
         if self._q_reset:
             self._qf1.load_state_dict(self._random_qf1_state_dict)
             self._qf2.load_state_dict(self._random_qf2_state_dict)
+            # The formal critic-reset baseline resets both critic parameters
+            # and their Adam moments. Carrying the old moments would define a
+            # different weights-only reset intervention.
+            self._qf1_optimizer = self._make_network_optimizer(
+                self._qf1, self._qf_lr)
+            self._qf2_optimizer = self._make_network_optimizer(
+                self._qf2, self._qf_lr)
+            print('CRITIC_RESET', json.dumps({
+                'completed_task_position': int(seq_idx),
+                'next_task_position': int(seq_idx + 1),
+                'critic_parameters': 'initialization',
+                'critic_adam': 'reset',
+                'target_critics': 'hard_sync_after_reset',
+                'global_critic_updates': int(self.global_step),
+            }), flush=True)
 
         qf1_state_dict = copy.deepcopy(self._qf1.state_dict())
         qf2_state_dict = copy.deepcopy(self._qf2.state_dict())
@@ -1859,6 +2152,8 @@ class SAC(RLAlgorithm):
 
         if self._bellman_probe:
             self._bellman_probe_task_start_step = self.global_step
+        self._task_env_start_step = self.global_env_step
+        return bellman_probe_metric
     
     def save_models(self, log_name = None):
 

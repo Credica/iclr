@@ -3,6 +3,8 @@ import torch
 from torch import nn
 
 from garage.torch.algos import MTSAC, PPO
+from garage.torch.algos.sac import (
+    _capture_training_rng_state, _restore_training_rng_state)
 from garage.torch.policies import TanhGaussianMLPPolicy, GaussianMLPPolicy
 from garage.replay_buffer import ExpertBuffer
 from garage.torch import as_torch_dict
@@ -13,6 +15,7 @@ import random
 from tqdm import tqdm
 from time import time
 import pickle
+from pathlib import Path
 
 import wandb
 
@@ -22,6 +25,7 @@ class RND_SAC(MTSAC):
                  replay_buffer_size=int(1e6), nepochs_offline=5,
                  env_seq=None, bc_kl='reverse', distill_kl='forward',
                  reset_offline_actor=False, teacher_steps=int(3e6),
+                 teacher_root='.',
                  **sac_kwargs):
         super().__init__(**sac_kwargs)
         self._cl_reg_coef=cl_reg_coef
@@ -30,6 +34,7 @@ class RND_SAC(MTSAC):
         self._nepochs_offline = nepochs_offline
         self._reset_offline_actor=reset_offline_actor
         self._teacher_steps = int(teacher_steps)
+        self._teacher_root = Path(teacher_root).expanduser().resolve()
         self._env_seq=env_seq
         self._bc_kl = bc_kl
         self._distill_kl=distill_kl
@@ -45,6 +50,8 @@ class RND_SAC(MTSAC):
         self.results['Policy loss'] = []
         self.results['BC loss'] = []
         self.results['Speed (it/s)'] = []
+        self.results['Distillation update'] = []
+        self.results['Distillation task index'] = []
 
         
     
@@ -59,27 +66,25 @@ class RND_SAC(MTSAC):
         target_task_name = self._env_seq[0]
         
         # Skip first task & load policy
-        model_name = 'policy_metaworld_sac_{}_{}_{}.pt'.format(
-            target_task_name, self._teacher_steps, self._seed)
-        # model_name = 'policy_metaworld_sac_{}_{}.pt'.format(target_task_name, self._seed)
-    
-        target_policy_state_dict = torch.load('./models/sac_models/'+model_name, map_location=global_device())
-        # target_policy_state_dict = torch.load('./models/'+model_name, map_location=global_device())
-        policy_state_dict = self.policy.state_dict()
-
-        target_policy_state_dict = {k: v for k, v in target_policy_state_dict.items() if k in policy_state_dict}
-        policy_state_dict.update(target_policy_state_dict)
-        self.policy.load_state_dict(policy_state_dict)
+        target_policy_state_dict = torch.load(
+            self._teacher_model_path(target_task_name),
+            map_location=global_device())
+        self._copy_teacher_policy_state(
+            self.policy, target_policy_state_dict, seq_idx=0)
         
         self.load_target_policy_and_buffer(0, self._replay_buffer_size)
-        last_return = self._evaluate_policy(trainer.step_itr)
+        evaluation_rng_state = _capture_training_rng_state()
+        try:
+            last_return = self._evaluate_policy(trainer.step_itr)
+        finally:
+            _restore_training_rng_state(evaluation_rng_state)
         self.on_task_start(0)
 
         task_list = list(range(1,tasknum))
 
         for seq_idx in task_list:
             target_policy = self.load_target_policy_and_buffer(seq_idx, self._replay_buffer_size)
-            total_observations, total_target_means, total_target_log_stds = self.make_single_task_targets(target_policy)
+            total_observations, total_target_means, total_target_log_stds = self.make_single_task_targets(target_policy, seq_idx)
             num_iter = 0
 
             if self._reset_offline_actor:
@@ -125,20 +130,34 @@ class RND_SAC(MTSAC):
                     if global_step % 1000 == 0:
                         if self._use_wandb:
                             wandb.log({
+                                'Learner role': 'R&D offline student',
+                                'Distillation update': global_step,
+                                'Distillation task index': seq_idx,
                                 'Policy loss': policy_loss.item(),
                                 'BC loss': bc_loss.item(),
-                                'Speed (it/s)' : (self.global_step / (end_time - self.start_time))
+                                'Speed (it/s)' : (global_step / max(
+                                    end_time - self.start_time, 1e-9))
                             })
 
                         self.results['Policy loss'].append(policy_loss.item())
                         self.results['BC loss'].append(bc_loss.item())
-                        self.results['Speed (it/s)'].append((self.global_step / (end_time - self.start_time)))
+                        self.results['Speed (it/s)'].append(
+                            global_step / max(
+                                end_time - self.start_time, 1e-9))
+                        self.results['Distillation update'].append(global_step)
+                        self.results['Distillation task index'].append(seq_idx)
 
                 
-            last_return = self._evaluate_policy(trainer.step_itr)
+            evaluation_rng_state = _capture_training_rng_state()
+            try:
+                last_return = self._evaluate_policy(trainer.step_itr)
+            finally:
+                _restore_training_rng_state(evaluation_rng_state)
             self.save_results()
             
             self.on_task_start(seq_idx)
+
+        return np.mean(last_return)
                 
     
     def on_task_start(self, seq_idx):
@@ -189,36 +208,26 @@ class RND_SAC(MTSAC):
 
         target_task_name = self._env_seq[seq_idx]
 
-        model_name = 'policy_metaworld_sac_{}_{}_{}.pt'.format(
-            target_task_name, self._teacher_steps, self._seed)
-        buffer_name = 'rollouts_metaworld_sac_{}_{}_{}.pkl'.format(
-            target_task_name, self._teacher_steps, self._seed)
-
         # Load policy
         target_policy = copy.deepcopy(self.policy)
-        loaded_state_dict = torch.load('./models/sac_models/'+model_name, map_location=global_device())
-        
-        target_policy_state_dict = target_policy.state_dict()
-
-        loaded_state_dict = {k: v for k, v in loaded_state_dict.items() if k in target_policy_state_dict}
-        target_policy_state_dict.update(loaded_state_dict)
-        target_policy.load_state_dict(target_policy_state_dict)
+        loaded_state_dict = torch.load(
+            self._teacher_model_path(target_task_name),
+            map_location=global_device())
+        self._copy_teacher_policy_state(
+            target_policy, loaded_state_dict, seq_idx=seq_idx)
 
         _device = "cpu"
         if global_device() != None:
             _device = global_device()
 
-        with open('./rollouts/sac_rollouts/' + buffer_name, "rb") as file:
+        with open(self._teacher_rollout_path(target_task_name), "rb") as file:
             data = pickle.load(file)
         self.observations = data['observation'][:replay_buffer_size].to(_device)
 
         return target_policy
 
     
-    def make_single_task_targets(self, target_policy):
-        
-        total_samples = self.replay_buffer.get_all_transitions()
-        total_samples = as_torch_dict(total_samples)
+    def make_single_task_targets(self, target_policy, seq_idx):
         observations = self.observations
 
         means = []
@@ -232,7 +241,8 @@ class RND_SAC(MTSAC):
                 end = i+self.BATCH_SIZE
             with torch.no_grad():
                 
-                action_info = target_policy(observations[start:end], 0)[1]
+                action_info = target_policy(
+                    observations[start:end], seq_idx)[1]
                 mean, log_std = action_info['mean'], action_info['log_std']
                 means.append(mean)
                 log_stds.append(log_std)
@@ -241,6 +251,67 @@ class RND_SAC(MTSAC):
         log_std_targets = torch.cat(log_stds)
 
         return observations, mean_targets, log_std_targets
+
+    def _teacher_stem(self, task_name):
+        env_type = ('dm_control' if task_name.startswith('DMControl-')
+                    else 'metaworld')
+        return '{}_sac_{}_{}_{}'.format(
+            env_type, task_name, self._teacher_steps, self._seed)
+
+    def _teacher_model_path(self, task_name):
+        return (self._teacher_root / 'models' / 'sac_models' /
+                ('policy_' + self._teacher_stem(task_name) + '.pt'))
+
+    def _teacher_rollout_path(self, task_name):
+        return (self._teacher_root / 'rollouts' / 'sac_rollouts' /
+                ('rollouts_' + self._teacher_stem(task_name) + '.pkl'))
+
+    @staticmethod
+    def _output_key_for_task(key, seq_idx):
+        marker = '._output_layers.'
+        if marker not in key:
+            return key
+        prefix, suffix = key.split(marker, 1)
+        head_text, remainder = suffix.split('.', 1)
+        teacher_head = int(head_text)
+        if teacher_head not in (0, 1):
+            return None
+        return '{}{}{}.{}'.format(
+            prefix, marker, 2 * seq_idx + teacher_head, remainder)
+
+    def _copy_teacher_policy_state(self, policy, teacher_state, seq_idx):
+        """Copy a one-task teacher into one head of a sequence policy.
+
+        DMC sequence policies concatenate heterogeneous observation spaces.
+        For their first shared layer, place the teacher columns in the slice
+        selected by the target task's zero-padding module.
+        """
+        student_state = policy.state_dict()
+        copied = 0
+        for teacher_key, teacher_value in teacher_state.items():
+            student_key = self._output_key_for_task(teacher_key, seq_idx)
+            if student_key is None or student_key not in student_state:
+                continue
+            student_value = student_state[student_key]
+            if teacher_value.shape == student_value.shape:
+                student_state[student_key] = teacher_value
+                copied += 1
+                continue
+            first_layer = '._layers.0.linear.weight'
+            if (first_layer in teacher_key and teacher_value.ndim == 2 and
+                    student_value.ndim == 2 and
+                    teacher_value.shape[0] == student_value.shape[0] and
+                    hasattr(policy, '_zero_pad_per_task')):
+                left = policy._zero_pad_per_task[seq_idx].padding[0]
+                right = left + teacher_value.shape[1]
+                if right <= student_value.shape[1]:
+                    expanded = student_value.clone()
+                    expanded[:, left:right] = teacher_value
+                    student_state[student_key] = expanded
+                    copied += 1
+        if copied == 0:
+            raise ValueError('No compatible R&D teacher policy parameters found')
+        policy.load_state_dict(student_state)
         
 
     @staticmethod

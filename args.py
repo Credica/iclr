@@ -32,7 +32,8 @@ def parse_args():
                                  'ewc',
                                  'finetuning',
                                  'rnd', 
-                                 'pandc',], 
+                                 'pandc',
+                                 'spectral',],
                         help='(default=%(default)s)')
     parser.add_argument('--seed', type=int, default=0, metavar='N',
                         help='seed (default: 0)')
@@ -50,6 +51,12 @@ def parse_args():
                         help='每个任务内两次裁剪之间的 critic 更新数')
     parser.add_argument('--singular_clip_start_task', type=int, default=0,
                         help='开始启用 critic 谱裁剪的零基任务编号；大于 0 时在该任务入口立即裁剪')
+    parser.add_argument('--spectral_actor_coef', type=float, default=1e-4,
+                        help='SpectralReg actor coefficient (paper default: 1e-4)')
+    parser.add_argument('--spectral_critic_coef', type=float, default=1e-4,
+                        help='SpectralReg coefficient for each critic (paper default: 1e-4)')
+    parser.add_argument('--spectral_power_iterations', type=int, default=1,
+                        help='Power iterations per SAC update (paper default: 1)')
     
     parser.add_argument('--wandb', type=str2bool, default=True, metavar='N',
                         help='Use wandb')
@@ -61,7 +68,7 @@ def parse_args():
     parser.add_argument('--steps_per_task', type=int, default=int(3e6), metavar='N',
                         help='steps per task (default: int(3e6))')
     parser.add_argument('--exact_sac_task_budget', type=str2bool, default=False,
-                        help='Count exactly steps_per_task SAC gradient updates per task')
+                        help='Count exactly steps_per_task environment interactions per task, including replay warm-up')
     parser.add_argument('--nepochs_offline', type=int, default=int(5), metavar='N',
                         help='number of epochs for offline training (default: int(100))')
 
@@ -113,10 +120,19 @@ def parse_args():
                         help="Use InFeR loss if True")
     parser.add_argument('--ReDo', default=False, type=str2bool,
                         help="Use ReDo if True")
+    parser.add_argument('--redo_interval', default=1000, type=int,
+                        help='Environment-step interval for ReDo recycling')
+    parser.add_argument('--redo_tau', default=0.1, type=float,
+                        help='Normalized activation-score threshold for ReDo')
     parser.add_argument('--reset_offline_actor', default=False, type=str2bool,
                         help="Reset the offline actor in R&D")
     parser.add_argument('--rd_teacher_steps', default=int(3e6), type=int,
                         help='Training steps used by the single-task R&D teachers')
+    parser.add_argument('--rd_teacher_root', default='.', type=str,
+                        help='Root containing models/sac_models and rollouts/sac_rollouts for R&D teachers')
+    parser.add_argument('--save_single_task_artifacts', default=False,
+                        type=str2bool,
+                        help='Save model/buffer/rollout even when probes are enabled')
     parser.add_argument('--wasserstein', default=0, type=float,
                         help="Use Wasserstein loss if positive")
     
@@ -133,13 +149,19 @@ def parse_args():
     
     parser.add_argument('--no_stats', type=str2bool, default=True, metavar='N',
                         help='Do not store the statistics')
+    parser.add_argument('--scalar_log_interval', type=int, default=1000,
+                        help='Environment steps between loss/reward/alpha/speed/zero-ratio logs')
+    parser.add_argument('--feature_stats_interval', type=int, default=10000,
+                        help='Environment steps between feature-rank and weight-change logs')
+    parser.add_argument('--hessian_stats_interval', type=int, default=10000,
+                        help='Environment steps between Hessian-rank logs')
 
     parser.add_argument('--bellman_probe', type=str2bool, default=False,
                         help='Measure critic feature/Bellman subspace alignment')
     parser.add_argument('--bellman_probe_size', type=int, default=1024,
                         help='Fixed transition probes retained per task')
     parser.add_argument('--bellman_probe_interval', type=int, default=100000,
-                        help='Critic gradient steps between Bellman probes')
+                        help='Environment steps between Bellman probes')
     parser.add_argument('--bellman_probe_targets', type=int, default=8,
                         help='Stochastic soft Bellman targets per probe')
     parser.add_argument('--bellman_probe_ridge', type=float, default=1e-3,

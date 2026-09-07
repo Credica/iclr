@@ -116,7 +116,12 @@ class MTSAC(SAC):
         infer = False,
         wasserstein = 0,
         ReDo = False,
+        redo_interval=1000,
+        redo_tau=0.1,
         no_stats = False,
+        scalar_log_interval=1000,
+        feature_stats_interval=10000,
+        hessian_stats_interval=10000,
         multi_input = False,
         bellman_probe=False,
         bellman_probe_size=1024,
@@ -164,6 +169,10 @@ class MTSAC(SAC):
         dar_task_indices=None,
         dsr_v2=False,
         dsr_v2_kwargs=None,
+        spectral_regularization=False,
+        spectral_actor_coef=1e-4,
+        spectral_critic_coef=1e-4,
+        spectral_power_iterations=1,
     ):
 
         super().__init__(
@@ -201,7 +210,12 @@ class MTSAC(SAC):
             infer=infer,
             wasserstein=wasserstein, 
             ReDo=ReDo,
+            redo_interval=redo_interval,
+            redo_tau=redo_tau,
             no_stats=no_stats,
+            scalar_log_interval=scalar_log_interval,
+            feature_stats_interval=feature_stats_interval,
+            hessian_stats_interval=hessian_stats_interval,
             multi_input=multi_input,
             bellman_probe=bellman_probe,
             bellman_probe_size=bellman_probe_size,
@@ -248,7 +262,11 @@ class MTSAC(SAC):
             dar_alignment_lr=dar_alignment_lr,
             dar_task_indices=dar_task_indices,
             dsr_v2=dsr_v2,
-            dsr_v2_kwargs=dsr_v2_kwargs)
+            dsr_v2_kwargs=dsr_v2_kwargs,
+            spectral_regularization=spectral_regularization,
+            spectral_actor_coef=spectral_actor_coef,
+            spectral_critic_coef=spectral_critic_coef,
+            spectral_power_iterations=spectral_power_iterations)
         self._num_tasks = num_tasks
         self._eval_env = eval_env
         self._use_automatic_entropy_tuning = fixed_alpha is None

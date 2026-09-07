@@ -28,7 +28,7 @@
 | E1 | P1–P6 的 FT 首批运行 | 18 个双任务 runs | 2026-09-07 已启动 | 18 个 runs 完整结束，字段审计无缺失，结果只用于质检和后续同源分支 |
 | E2 | 完整 6×6 rethink 矩阵：FT、Reset、Clip | 18 个源预训练 + 324 个目标分支 | 待实现/运行 | 三方法同源、共同 warm-up、边界行为和完整矩阵核验通过 |
 | E3 | 64 状态 MRP 与真实 critic 离线机制实验 | 不增加正式在线 RL runs | 待实现 | 理论量、共同 correction、共同 target 和实际更新误差可重算 |
-| E4 | 五条主序列 × 七方法 | 105 个序列配置 | 待实现/运行 | 七方法均满足相同协议，DMC 与重复任务路径通过 smoke tests |
+| E4 | 五条主序列 × 八方法 | 120 个序列配置 | 待实现/运行 | 八方法均满足相同协议，DMC 与重复任务路径通过 smoke tests |
 | E5 | 汇总、配对统计和图表数据审计 | 不增加正式在线 RL runs | 待实现 | Tables 1–3 与 Figs. 1–4 的每个数均可追溯到 run、seed、checkpoint 和角色 |
 
 E1 正在运行的进程使用启动时冻结的源码快照；仓库后续清理不会改变这些进程的代码。E1 只提供 FT 证据，不能提前支持 Reset 或 Clip 的因果结论。
@@ -55,7 +55,7 @@ E1 正在运行的进程使用启动时冻结的源码快照；仓库后续清�
 - Reset：重置双 online Q、双 target Q 和 critic Adam 状态；actor 保留。
 - Clip：从第二个任务开始，在每个任务入口及任务内每 200k 环境步裁剪双 online critic 的全部 Linear 权重到奇异值区间 [0.25, 4]；保留 actor、bias 和 Adam moments；裁剪后同步 target Q。
 - 同一时刻的入口事件和周期事件只执行一次。
-- FAME、Spectral regularization、R&D 分别记录 fast/meta、正则模块、teacher/student 的模型身份和方法专有状态。
+- P&C、Spectral regularization、R&D 分别记录 active-column/knowledge-base、power-iteration 正则状态、teacher/student 的模型身份和方法专有状态。
 
 ### 3.4 Checkpoint 与恢复
 
@@ -70,7 +70,7 @@ E1 正在运行的进程使用启动时冻结的源码快照；仓库后续清�
 - 同 seed 的同源分支具有相同 A checkpoint、B warm-up transitions、实例 bank 和初始化 hash。
 - 打开记录功能不改变相同 minibatch 下的 loss、参数更新和训练 RNG。
 - Reset 和 Clip 的 before/after 权重、Q 输出、target 同步和 optimizer 处理与定义一致。
-- DMC walker 任务注册、DMC 接口、重复访问任务和所有七种方法均能完成短程运行。
+- DMC walker 任务注册、DMC 接口、重复访问任务和所有八种方法均能完成短程运行。
 - 所有 JSONL 可逐行解析；缺失值使用 null/不适用，不用 0 冒充。
 
 ## 4. E1–E2：Rethink 迁移矩阵
@@ -159,19 +159,30 @@ E1 正在运行的进程使用启动时冻结的源码快照；仓库后续清�
 
 Meta-World 名称在配置中统一使用 `-v2` 后缀。
 
-### 6.2 七种方法与开跑条件
+### 6.2 八种方法与开跑条件
 
 | 方法 | 正式定义 | 开跑前缺口 |
 |---|---|---|
 | FT | 普通 SAC 连续微调 | 统一主序列入口与记录协议 |
 | Reset | critic-only Q reset，并重置 critic Adam | 补齐 optimizer reset 并验证边界 |
 | EWC | 原版 EWC，不叠加 Clip | 固定 Fisher、正则参数范围和系数记录 |
-| FAME | 单一 FAME-KL | 接入 SAC/Meta-World/DMC 统一协议 |
-| Spectral regularization | 独立的 SAC 谱正则 baseline | 实现正式正则公式与系数，不能以 hard clip 代替 |
-| R&D | reset-and-distill teacher/student 管线 | 校验数据、teacher/student 角色和 DMC 接口 |
+| P&C | EWC-compression 的 Progress & Compress；任务后重置 active column 与 adaptor | 正式开关已固定；异构 DMC-style observation/action spec 上的 SAC 更新 smoke 已通过 |
+| Spectral regularization | k=2；每层 $(\sigma_{\max}(W)^2-1)^2+\lVert b\rVert_2^4$；actor/双 online critic 均取 1e-4；多 head actor 只正则共享层与当前任务 mean/log-std heads，不改未激活 heads | 已有 `--cl_method spectral` 与单步 power iteration；完成 DMC 环境 smoke test，不能以 hard clip 代替 |
+| ReDo | 每 1k task-local 环境步按归一化平均绝对激活（tau=0.1）识别 dormant neurons；重置 incoming、清零 outgoing、清除对应 Adam moments，并同步双 target Q | 周期实现与单元测试已完成；正式长程前保留短程 Meta-World/DMC smoke |
+| R&D | reset-and-distill teacher/student 管线 | 双机脚本先生成/复用同 seed、1.5M 单任务 teacher model+rollout，再通过固定绝对路径启动离线 student；DMC 异构输入切片和任务 head 映射已有单元测试 |
 | Clip（ours） | 第二任务起的 critic 双侧谱裁剪 | 补 DMC、分支、环境时钟、每个后续任务入口和统一诊断 |
 
-所有方法在 F1、F2、F3、D-W6、D-C4 上运行 seeds 1、2、3，共 7×5×3=105 个序列配置。按任务数计的名义训练预算为 1.26B 环境交互步，其中 R&D 的 teacher 预算已包含在内；student 的离线蒸馏不伪装成额外在线学习曲线。
+所有方法在 F1、F2、F3、D-W6、D-C4 上运行 seeds 1、2、3，共 8×5×3=120 个序列配置。按任务数计的名义训练预算为 1.44B 环境交互步，其中 R&D 的 teacher 预算已包含在内；student 的离线蒸馏不伪装成额外在线学习曲线。
+
+### 6.2.1 双机 baseline 分配（2026-09-08）
+
+不含 Clip（ours）的七个 baseline 共 7×5×3=105 个主序列 runs。固定生成器为
+`scripts/generate_baseline_matrix.py`，两台物理机器分别使用
+`scripts/run_baselines_machine_1.sh` 与 `scripts/run_baselines_machine_2.sh`；每台机器使用本地 GPU 0–7，每卡最多两个进程，空闲 slot 自动从本机队列补位。机器 1 分配 53 个 runs（440 个任务位置），机器 2 分配 52 个 runs（400 个任务位置）。按域聚合 R&D 后，机器 1 生成全部 48 个 Meta-World teacher/task/seed 前置项，机器 2 生成全部 15 个 DMC 前置项，teacher 不跨机重复；另移动一个非 R&D run 保持 53/52 平衡。每次生成同时保存逐 run JSON manifest，其中包含 method、完整任务名/索引、seed、命令、机器编号和依赖标记。
+
+所有在线 SAC/teacher 命令显式使用 `--wandb True` 与 50 evaluation episodes。loss、reward、alpha、speed、zero ratio 每 1k 环境步；feature rank、weight change 每 10k；Hessian rank 每 10k 且在同一模型状态后进行 10k evaluation；Bellman probe 每 100k。`--no_stats False` 打开这些统计；诊断和评估前后恢复 Python/NumPy/Torch/CUDA RNG。full-Jacobian Bellman spectral stats 固定在 10k、50k、100k、500k、1M、1.5M，不改成等间隔扫描。probe/checkpoint 与所有生成结果写入仓库外的 run 独立目录。
+
+R&D manifest 仍标记 `requires_teacher_artifacts=true`，但依赖不再留给人工处理。每台机器先运行 `baseline_prerequisites_machine_N.txt`：完整的 model+rollout 对存在时复用，否则按相同 seed 和 1.5M 预算训练单任务 teacher；前置队列全部成功后才运行 `baseline_jobs_machine_N.txt`。student 通过 `--rd_teacher_root` 读取显式根目录；Meta-World 与 DMC 使用各自与 `make_log_name` 一致的文件名，DMC teacher 的局部输入权重映射到序列网络对应输入切片并写入对应 occurrence head。
 
 ### 6.3 主结果指标
 
@@ -188,7 +199,7 @@ DMC：
 - Table 2 每格报告 first-pass return-AUC / revisit return-AUC / 最终已见任务平均 return；
 - 同名任务的不同 occurrence/head 不合并，DMC 与 Meta-World 不合成无量纲总分。
 
-R&D 的获取曲线来自 teacher、保留结果来自部署 student；FAME 的获取曲线来自 fast learner、保留结果来自 meta learner。图例、manifest 和表注必须显式记录角色，不能拼成一个虚构 agent。
+R&D 的获取曲线来自 teacher、保留结果来自部署 student；P&C 的获取曲线来自 active column，旧任务保留来自 knowledge base，当前任务来自 active column。图例、manifest 和表注必须显式记录角色，不能拼成一个虚构 agent。
 
 ## 7. 每个 run 必须保存的原始记录
 
@@ -209,9 +220,9 @@ Anchors、target windows 和 checkpoints 按 `PAPER_OUTLINE_20260907.md` 第 6 �
 
 | 部分 | 计划预算 |
 |---|---:|
-| 五条主序列 × 七方法 × 三 seeds | 1.26B 训练环境交互 |
+| 五条主序列 × 八方法 × 三 seeds | 1.44B 训练环境交互 |
 | 6×6 rethink：18 个源预训练 + 324 个目标分支 | 513M 训练环境交互 |
-| 合计名义配额 | 1.773B 训练环境交互 |
+| 合计名义配额 | 1.953B 训练环境交互 |
 
 以下内容不得重复计费或重复运行：
 
@@ -222,7 +233,7 @@ Anchors、target windows 和 checkpoints 按 `PAPER_OUTLINE_20260907.md` 第 6 �
 
 ## 9. 明确不运行的旧方案
 
-本轮不运行 H8、E8、CW20、ABC、RPP，不运行 actor-only、norm-only、随机扰动、from-A clip、阈值扫描、BRO、ReDo、Muon 或额外无边界在线组，也不追加大规模 baseline/消融矩阵。
+本轮不运行 H8、E8、CW20、ABC、RPP，不运行 actor-only、norm-only、随机扰动、from-A clip、阈值扫描、BRO、Muon 或额外无边界在线组，也不追加 ReDo 阈值/频率扫描或其他大规模 baseline/消融矩阵。
 
 因此本轮不能据实验声称：critic 是唯一原因、第二任务起裁剪优于全程裁剪、当前阈值最优，或已经排除全部探索、范数与 optimizer 解释。
 
