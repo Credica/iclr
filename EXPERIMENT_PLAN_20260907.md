@@ -169,7 +169,7 @@ Meta-World 名称在配置中统一使用 `-v2` 后缀。
 | P&C | EWC-compression 的 Progress & Compress；任务后重置 active column 与 adaptor | 采样/训练/评估/压缩共用固定旧 KB 侧向连接；压缩目标不随 live KB 更新漂移；状态随 Bellman checkpoint 保存 |
 | Spectral regularization | k=2；每层 $(\sigma_{\max}(W)^2-1)^2+\lVert b\rVert_2^4$；actor/双 online critic 均取 1e-4；多 head actor 只正则共享层与当前任务 mean/log-std heads，不改未激活 heads | 已有 `--cl_method spectral` 与单步 power iteration；完成 DMC 环境 smoke test，不能以 hard clip 代替 |
 | ReDo | 每 1k task-local 环境步按归一化平均绝对激活（tau=0.1）识别 dormant neurons；重置 incoming、清零 outgoing、清除对应 Adam moments，并同步双 target Q | 周期实现与单元测试已完成；正式长程前保留短程 Meta-World/DMC smoke |
-| R&D | reset-and-distill teacher/student 管线 | 双机脚本先生成/复用同配置、同 seed、1.5M teacher 与训练 bank rollout；完成标记仅作可选追溯；student 每阶段仅评估已见 head，单独记录蒸馏时钟 |
+| R&D | reset-and-distill teacher/student 管线 | `--run` 先完成本机非 R&D，再自动生成/复用同配置、同 seed、1.5M teacher 与训练 bank rollout 并蒸馏；完成标记仅作可选追溯；student 每阶段仅评估已见 head，单独记录蒸馏时钟 |
 | Clip（ours） | 第二任务起的 critic 双侧谱裁剪 | 主序列入口已支持 MW/DMC、环境时钟、所有后续任务入口及现有 probes；E2 同源 checkpoint 分支和完整 E0 数据契约仍待补 |
 
 所有方法在 F1、F2、F3、D-W6、D-C4 上运行 seeds 1、2、3，共 8×5×3=120 个序列配置。按任务数计的名义训练预算为 1.44B 环境交互步，其中 R&D 的 teacher 预算已包含在内；student 的离线蒸馏不伪装成额外在线学习曲线。
@@ -199,11 +199,19 @@ V100 长程训练未在此验证中执行；队列只做了生成和 dry-run，�
 
 不含 Clip（ours）的七个 baseline 共 7×5×3=105 个主序列 runs。固定生成器为
 `scripts/generate_baseline_matrix.py`，两台物理机器分别使用
-`scripts/run_baselines_machine_1.sh` 与 `scripts/run_baselines_machine_2.sh`；每台机器使用本地 GPU 0–7，每卡最多两个进程，空闲 slot 自动从本机队列补位。机器 1 分配 53 个 runs（440 个任务位置），机器 2 分配 52 个 runs（400 个任务位置）。按域聚合 R&D 后，机器 1 生成全部 48 个 Meta-World teacher/task/seed 前置项，机器 2 生成全部 15 个 DMC 前置项，teacher 不跨机重复；另移动一个非 R&D run 保持 53/52 平衡。每次生成同时保存逐 run JSON manifest，其中包含 method、完整任务名/索引、seed、命令、机器编号和依赖标记。
+`scripts/run_baselines_machine_1.sh` 与 `scripts/run_baselines_machine_2.sh`；每台机器使用本地 GPU 0–7，每卡最多两个进程，空闲 slot 自动从本机队列补位。机器 1 分配 53 个 runs（440 个任务位置），机器 2 分配 52 个 runs（400 个任务位置）。R&D 的 F1/F2/F3 × seeds 1/2/3 全在机器 1，D-W6/D-C4 × seeds 1/2/3 全在机器 2；分别需要 48 个 Meta-World、15 个 DMC teacher/task/seed 前置项，本机内部去重、跨机无重复 teacher。非 R&D 按全局 run ID 交替分配，但 FT/F1/seed 1 放在机器 2，得到 44/46 个非 R&D runs。每次生成保存逐 run JSON manifest，包括完整任务、seed、命令、机器、阶段和依赖；这个分配不保证两台墙钟耗时相同。
 
 所有在线 SAC/teacher 命令显式使用 `--wandb True` 与 50 evaluation episodes。loss、reward、alpha、speed、zero ratio 每 1k 环境步；feature rank、weight change 每 10k；Hessian rank 每 10k 且在同一模型状态后进行 10k evaluation；Bellman probe 每 100k。`--no_stats False` 打开这些统计；诊断和评估前后恢复 Python/NumPy/Torch/CUDA RNG。full-Jacobian Bellman spectral stats 固定在 10k、50k、100k、500k、1M、1.5M，不改成等间隔扫描。probe/checkpoint 与所有生成结果写入仓库外的 run 独立目录。
 
-R&D manifest 仍标记 `requires_teacher_artifacts=true`，但依赖不再留给人工处理。每台机器先运行 `baseline_prerequisites_machine_N.txt`：按 env type、task、1.5M 预算和 seed 命名的 model、rollout 均存在时复用，否则训练单任务 teacher 并导出；前置队列全部成功后才运行 `baseline_jobs_machine_N.txt`。student 通过 `--rd_teacher_root` 读取显式根目录 `<ARTIFACT_ROOT>/teachers/`。新导出的 `complete_<teacher-stem>.json` 仅作可选追溯，不再作为复用前提，也不因缺少它就强制重训。Meta-World 与 DMC 使用各自与 `make_log_name` 一致的文件名，DMC teacher 的局部输入权重映射到序列网络对应输入切片并写入对应 occurrence head。
+两个 bash 的 `--run` 自动执行两个阶段，无需第二次手动启动：第一阶段运行 `baseline_non_rnd_machine_N.txt`，机器 1 为 44 runs，机器 2 为 46 runs，共 90 runs；按 FT → Reset → EWC → P&C → Spectral regularization → ReDo 派发，方法之间可以重叠，每个空闲 slot 接续下一个完整序列 run。
+
+本机非 R&D 队列全部成功后自动进入第二阶段：先运行 `baseline_prerequisites_machine_N.txt`（机器 1 为 48 个 MW teacher，机器 2 为 15 个 DMC teacher），全部成功后运行 `baseline_rnd_machine_N.txt`（机器 1 为 9 个 MW student runs，机器 2 为 6 个 DMC student runs）。总顺序为机器 1：44 → 48 → 9，机器 2：46 → 15 → 6。两台机器互不等待，因此一台进入 R&D 时另一台可能仍在跑非 R&D；第一阶段不后台训练 teacher。
+
+每个队列内失败的任务会被记录，其余任务继续；当前队列存在失败则阻止进入下一队列，不自动重试。更新后仅用于尚未启动的批次，不能覆盖运行中 manifest 后盲目重跑。
+
+`baseline_jobs_machine_N.txt` 保留全部 53/52 个 baseline 命令，仅作审计，不应作为单一队列启动以免绕过 teacher 依赖。JSON manifest 为 schema 4，保存完整配置、分阶段计数和执行顺序/队列路径；队列日志分置 `queue/machineN/non_rnd`、`teachers`、`rnd`。`--prepare-only` 仅生成清单，不启动训练。
+
+R&D manifest 仍标记 `requires_teacher_artifacts=true`，但依赖由第二阶段自动处理：按 env type、task、1.5M 预算和 seed 命名的 model、rollout 均存在时复用，否则训练单任务 teacher 并导出。student 通过 `--rd_teacher_root` 读取显式根目录 `<ARTIFACT_ROOT>/teachers/`。新导出的 `complete_<teacher-stem>.json` 仅作可选追溯，不再作为复用前提，也不因缺少它就强制重训。Meta-World 与 DMC 使用各自与 `make_log_name` 一致的文件名，DMC teacher 的局部输入权重映射到序列网络对应输入切片并写入对应 occurrence head。
 
 R&D 保留原方法的独立单任务专家训练、训练结束后新采集专家 rollout、结合历史任务记忆进行顺序蒸馏的流程；不是拿训练 replay buffer 替换专家 rollout。默认额外采集 1M observations，采集交互与 1.5M teacher 在线训练预算分开记账。五条序列、1.5M 预算和独立训练/评估 bank 是本文所有方法共用的实验设置，不声称逐项照搬原论文实验。rollout 只在训练 bank 上采集，不用独立评估 bank 训练 student。
 
@@ -217,7 +225,9 @@ R&D 保留原方法的独立单任务专家训练、训练结束后新采集专�
 
 新批次应使用新 artifact root，不混用修订前曲线。baseline 主队列仍不支持断点续训或自动跳过已完成 runs。上述修改不代表完整 E0、V100 满尺寸双进程显存及长程数值稳定性已全部验收。
 
-本次缓存复用修订后的 CPU 验证：分组执行的 39 项不同回归检查通过。8 项队列/缓存测试覆盖无完成标记的成对文件复用、文件缺失时训练分支、任务/seed/预算文件名不匹配、双机 prepare/dry-run；全部 168 条 baseline/teacher 命令参数与含空格路径均通过检查。环境与算法测试覆盖六种在线 baseline 的真实 DMC 两任务/4k 步训练（小网络，含 Hessian/Bellman）、真实 MW 独立实例 bank 与重放、DMC 50 个固定 reset、teacher rollout 仅使用训练 bank、R&D 小型合成 artifacts 加载及逐阶段已见任务评估、Clip 时钟/入口以及 P&C 等定向检查。未运行正式 1.5M teacher/student 实验或 V100 满尺寸双进程压力测试。
+此前缓存复用修订后的 CPU 验证：分组执行的 39 项不同回归检查通过。8 项队列/缓存测试覆盖无完成标记的成对文件复用、文件缺失时训练分支、任务/seed/预算文件名不匹配、双机 prepare/dry-run；全部 168 条 baseline/teacher 命令参数与含空格路径均通过检查。环境与算法测试覆盖六种在线 baseline 的真实 DMC 两任务/4k 步训练（小网络，含 Hessian/Bellman）、真实 MW 独立实例 bank 与重放、DMC 50 个固定 reset、teacher rollout 仅使用训练 bank、R&D 小型合成 artifacts 加载及逐阶段已见任务评估、Clip 时钟/入口以及 P&C 等定向检查。未运行正式 1.5M teacher/student 实验或 V100 满尺寸双进程压力测试。
+
+本次分阶段调度通过 9 项队列/缓存测试，含双机实际 launcher 配合 stub queue 验证自动先非 R&D、后 teacher、再 student，以及各阶段失败时阻断下一阶段；全部 168 条命令（105 baseline＋63 teacher）解析、分阶段文件划分和 dry-run 通过。测试核对每个 student 的本地 teacher 覆盖及跨机无重复项。105 个主实验与 63 个 teacher 的训练命令、机器分配与缓存复用修订版一致，仅改变执行阶段顺序；未启动正式训练。
 
 ### 6.3 主结果指标
 

@@ -226,34 +226,52 @@ def main():
     parser.add_argument('--machine', type=int, choices=(1, 2), required=True)
     parser.add_argument('--artifact-root', type=Path, required=True)
     parser.add_argument('--jobs-file', type=Path, required=True)
+    parser.add_argument('--non-rnd-jobs-file', type=Path,
+                        help='Phase 1 queue (default: beside the all-jobs audit file)')
+    parser.add_argument('--rnd-jobs-file', type=Path,
+                        help='Phase 2 student queue (default: beside the all-jobs audit file)')
     parser.add_argument('--prerequisite-jobs-file', type=Path, required=True)
     parser.add_argument('--manifest', type=Path, required=True)
     args = parser.parse_args()
 
     repo = Path(__file__).resolve().parents[1]
     artifact_root = args.artifact_root.resolve()
-    selected = [job for job in assignments(repo, artifact_root)
+    all_jobs = assignments(repo, artifact_root)
+    selected = [job for job in all_jobs
                 if job['machine'] == args.machine]
     expected = 53 if args.machine == 1 else 52
     assert len(selected) == expected
+    non_rnd_jobs = [job for job in selected if job['method'] != 'rnd']
+    rnd_jobs = [job for job in selected if job['method'] == 'rnd']
     prerequisites = teacher_prerequisites(repo, artifact_root, selected)
+    non_rnd_file = args.non_rnd_jobs_file or args.jobs_file.with_name(
+        'baseline_non_rnd_machine_{}.txt'.format(args.machine))
+    rnd_file = args.rnd_jobs_file or args.jobs_file.with_name(
+        'baseline_rnd_machine_{}.txt'.format(args.machine))
 
-    args.jobs_file.parent.mkdir(parents=True, exist_ok=True)
-    args.prerequisite_jobs_file.parent.mkdir(parents=True, exist_ok=True)
+    outputs = [args.jobs_file, non_rnd_file, rnd_file,
+               args.prerequisite_jobs_file, args.manifest]
+    if len({path.resolve() for path in outputs}) != len(outputs):
+        parser.error('Queue and manifest output paths must be distinct')
+    for path, label, jobs in (
+            (args.jobs_file, 'AUDIT ONLY: all baseline commands; use the staged launcher', selected),
+            (non_rnd_file, 'PHASE 1: six non-R&D baselines', non_rnd_jobs),
+            (args.prerequisite_jobs_file,
+             'PHASE 2a: R&D teachers; verify imported cache configuration before reuse', prerequisites),
+            (rnd_file, 'PHASE 2b: R&D students; requires all local teachers', rnd_jobs)):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('# {} (machine {}).\n{}'.format(
+            label, args.machine, ''.join(job['command'] + '\n' for job in jobs)))
     args.manifest.parent.mkdir(parents=True, exist_ok=True)
-    args.jobs_file.write_text(
-        '# Generated baseline commands for machine {}. Do not reorder.\n{}'.format(
-            args.machine, ''.join(job['command'] + '\n' for job in selected)))
-    args.prerequisite_jobs_file.write_text(
-        '# R&D single-task teachers for machine {}. Existing pairs are reused; verify imported cache configuration first.\n{}'.format(
-            args.machine,
-            ''.join(job['command'] + '\n' for job in prerequisites)))
     args.manifest.write_text(json.dumps({
-        'schema_version': 3,
+        'schema_version': 4,
         'status': 'staged_queue_prepared',
         'machine': args.machine,
         'total_global_jobs': 105,
         'machine_jobs': len(selected),
+        'phase_job_counts': {'non_rnd': len(non_rnd_jobs),
+                             'rnd_teachers': len(prerequisites),
+                             'rnd_students': len(rnd_jobs)},
         'methods': list(METHODS),
         'sequences': list(SEQUENCES),
         'sac_optimizer': 'adam',
@@ -269,9 +287,15 @@ def main():
             'spectral_stats': [10000, 50000, 100000, 500000, 1000000, 1500000],
         },
         'execution_phases': [
-            'Generate/reuse all machine-local single-task R&D teachers and rollouts.',
-            'Only after the prerequisite queue succeeds, launch assigned baseline runs.',
+            {'id': 'non_rnd', 'jobs_file': str(non_rnd_file),
+             'description': 'First finish the six non-R&D baselines on this machine.'},
+            {'id': 'rnd_teachers', 'jobs_file': str(args.prerequisite_jobs_file),
+             'description': 'Then train/reuse the machine-local R&D teachers and rollouts.'},
+            {'id': 'rnd_students', 'jobs_file': str(rnd_file),
+             'description': 'After all local teachers succeed, run R&D student distillation.'},
         ],
+        'phase_failure_policy': 'stop_before_next_phase_if_current_queue_fails',
+        'all_jobs_audit_file': str(args.jobs_file),
         'validation_evidence': [
             'Periodic normalized-activation ReDo, selective Adam-state clearing, and target-Q synchronization are unit-tested.',
             'P&C completes an SAC update on heterogeneous DMC-style observation/action specifications.',
@@ -280,9 +304,9 @@ def main():
         'teacher_prerequisites': prerequisites,
         'jobs': selected,
     }, indent=2) + '\n')
-    print('GENERATED machine={} teachers={} jobs={} prerequisites={} commands={} manifest={}'.format(
-        args.machine, len(prerequisites), len(selected),
-        args.prerequisite_jobs_file, args.jobs_file, args.manifest))
+    print('GENERATED machine={} non_rnd={} teachers={} rnd={} audit={} manifest={}'.format(
+        args.machine, len(non_rnd_jobs), len(prerequisites), len(rnd_jobs),
+        args.jobs_file, args.manifest))
 
 
 if __name__ == '__main__':

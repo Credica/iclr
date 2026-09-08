@@ -47,7 +47,7 @@ D-W6/D-C4 是本研究固定的 DMC 持续任务顺序。H8/E8/CW20/ABC/RPP 不�
 | P&C | Progress & Compress：active column 学习当前任务，再蒸馏到 knowledge base；compression 用 EWC 保护旧知识，不加 Clip | 正式配置固定 `use_pandc_bc=False, reset_column=True, reset_adaptor=True`；异构 DMC-style spec SAC 更新 smoke 已通过 |
 | Spectral regularization | ICLR 2025 的 k=2 layer spectral regularizer；actor 与双 online critic 系数均为 1e-4；多 head actor 只作用共享层与当前 mean/log-std heads，不改未激活 heads；不以 hard clip 冒充 | 已实现 `--cl_method spectral`，使用不消耗训练 RNG 的单步 power iteration；需完成统一协议 smoke test |
 | ReDo | Recycling Dormant Neurons：每 1k task-local 环境步按归一化平均绝对激活和固定 tau=0.1 回收；重采样 incoming、清零 outgoing；覆盖 actor 与双 critic | 已实现受影响 Adam moments 清理、双 target Q 同步与事件记录；固定配置，不做阈值/频率扫描 |
-| R&D | 完整 reset-and-distill，包括本任务 teacher 与部署 student | 双机 staged queue 先生成/复用同配置、同 seed、1.5M teacher model+rollout，不强制要求新完成标记；student 使用显式 artifact root；DMC 异构输入/head 映射已有单元测试 |
+| R&D | 完整 reset-and-distill，包括本任务 teacher 与部署 student | `--run` 先完成本机非 R&D，第二阶段自动生成/复用同配置、同 seed、1.5M teacher model+rollout 后蒸馏，不强制要求新完成标记；student 使用显式 artifact root；DMC 异构输入/head 映射已有单元测试 |
 | Clip（ours） | 第二任务起的 critic 双侧谱裁剪；具体定义见 §4.1 | MW/DMC 完整主序列、环境时钟、后续各入口和现有 probes 已接入；E2 分支及完整数据契约仍待补 |
 
 P&C 主实验固定使用论文的 EWC compression 路径，不使用仓库可选的 BC compression 变体。每次完成 compression 后重置 active column 及 adaptor；knowledge base、Fisher、compression optimizer 和已见任务计数都属于必须保存的方法状态。[P&C 原论文](https://proceedings.mlr.press/v80/schwarz18a.html)。
@@ -57,6 +57,8 @@ R&D 保留原方法的单任务专家训练、训练结束后额外采集专家 
 Reset 在这里不是 actor+critic 全重置，也不是 R&D。权重+Adam 的正式定义沿用上一版计划；本轮不新增一个 weights-only 训练组，旧 weights-only 结果仅作为历史结果标注。
 
 所有方法在五条流上运行 seeds 1/2/3，即 120 个主序列配置。每方法每任务 1.5M 的主实验名义配额共 1.44B 环境交互，其中包含 R&D 对应的教师训练配额，不再重复加算一份教师预算。R&D 的学生是离线蒸馏，不虚构额外的 student 在线 1.5M 曲线；教师也只训练 1.5M，不读取旧 3M 教师充当同预算结果。配置严格相同的单任务教师可以缓存复用，但账本同时列名义与实际成本。P&C 的 compression 不计作环境交互，但必须单独记录其梯度更新数、样本读取量和墙钟；ReDo 的神经元统计与 recycling 事件单独记账；额外 buffer 收集、评估、distillation/compression/probe 更新分别记账，不声称不同方法计算量相同。
+
+双机 baseline 自动执行顺序：机器 1 为 44 个非 R&D runs → 48 个 Meta-World teacher 前置项 → 9 个 R&D runs；机器 2 为 46 个非 R&D runs → 15 个 DMC teacher 前置项 → 6 个 R&D runs。每卡最多两个进程，本机当前队列全部成功才进入下一队列，两台互不等待；teacher 跨机无重复。具体队列和依赖见实验计划 §6.2.2。
 
 ### 1.3 主表直接填数
 

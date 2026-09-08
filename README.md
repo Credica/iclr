@@ -142,15 +142,19 @@ are recorded and do not stop the rest of the queue.
 The two physical machines use separate entry scripts and do not communicate.
 Each script generates its own fixed command list and JSON assignment manifest
 under the supplied artifact root. Prepare and inspect both manifests before
-removing `--prepare-only`:
+switching from `--prepare-only` to `--run`:
+
+`--run` automatically executes two stages: first all local non-R&D baselines,
+then R&D (teacher preparation followed by student distillation). Each queue must
+finish successfully before the next queue starts; no second launch is needed.
 
 ```bash
-# Run this only on machine 1 (53 main-study jobs).
+# Run this only on machine 1 (44 non-R&D -> 48 teachers -> 9 R&D runs).
 bash scripts/run_baselines_machine_1.sh \
     /data/reset-distill/baselines --prepare-only
 bash scripts/run_baselines_machine_1.sh /data/reset-distill/baselines --run
 
-# Run this only on machine 2 (52 main-study jobs).
+# Run this only on machine 2 (46 non-R&D -> 15 teachers -> 6 R&D runs).
 bash scripts/run_baselines_machine_2.sh \
     /data/reset-distill/baselines --prepare-only
 bash scripts/run_baselines_machine_2.sh /data/reset-distill/baselines --run
@@ -162,15 +166,42 @@ commands using `main_garage.py` must select logical device 0 with
 Activate the `reset-distill` environment before starting the queue and keep the
 artifact root outside the Git repository. The generated 105-run matrix contains
 seven baselines, five sequences, and three seeds. Machine 1 receives 53 runs
-(440 task positions) and machine 2 receives 52 runs (400 task positions). The
-domain-aware allocation avoids duplicating most R&D teachers across the two
-hosts: machine 1 prepares all 48 Meta-World teacher/task/seed artifacts and
-machine 2 prepares all 15 DMC artifacts, with no teacher duplicated across
-hosts. Each launcher first runs its generated teacher prerequisite queue, reuses
-existing model+rollout pairs with matching task/budget/seed filenames (no
-completion receipt required), and starts the baseline queue only after all
-prerequisites succeed. Imported caches must also match the training configuration;
-see the R&D compatibility notes below.
+(440 task positions) and machine 2 receives 52 runs (400 task positions).
+All Meta-World R&D runs (F1/F2/F3, seeds 1/2/3) stay on machine 1, and all DMC
+R&D runs (D-W6/D-C4, seeds 1/2/3) stay on machine 2. This requires 48 Meta-World
+and 15 DMC teacher/task/seed artifacts, with no cross-host teacher duplication.
+The automatic queue order is:
+
+| Machine | Phase 1: non-R&D runs | Phase 2a: teachers | Phase 2b: R&D runs |
+|---|---:|---:|---:|
+| 1 | 44 | 48 Meta-World | 9 Meta-World |
+| 2 | 46 | 15 DMC | 6 DMC |
+
+Within phase 1, commands are dispatched in FT → Reset → EWC → P&C → Spectral
+regularization → ReDo order. These methods may overlap: whenever a GPU slot
+becomes free, the next complete sequence run starts. Each phase uses GPU 0–7
+with at most two processes per GPU. Only after all local non-R&D runs succeed
+does the launcher prepare teachers; only after all local teacher jobs succeed
+does it start students. A failed job is recorded while the remaining jobs in
+its queue continue, but prevents entry into the next queue. There are no
+automatic retries or background teacher preparation during phase 1.
+The two machines do not wait for each other: one may enter R&D while the other
+is still finishing non-R&D. This allocation does not guarantee equal wall time.
+
+Generated files under `<ARTIFACT_ROOT>/manifests/` (N is 1 or 2):
+
+- `baseline_non_rnd_machine_N.txt`: phase 1 commands.
+- `baseline_prerequisites_machine_N.txt`: phase 2a teacher training/export or reuse.
+- `baseline_rnd_machine_N.txt`: phase 2b student distillation.
+- `baseline_jobs_machine_N.txt`: the full baseline list **for audit only**; do not
+  launch it as one queue, which would bypass the R&D dependency barrier.
+- `baseline_jobs_machine_N.json`: all run definitions and the ordered execution
+  phases with their queue paths/counts (schema 4).
+
+Queue logs are separated into `queue/machineN/non_rnd`, `teachers`, and `rnd`.
+Phase 2a reuses existing model+rollout pairs with matching task/budget/seed
+filenames (no completion receipt required). Imported caches must also match the
+training configuration; see the R&D compatibility notes below.
 
 All online SAC/teacher commands enable W&B and use actual environment steps:
 
@@ -186,9 +217,9 @@ All online SAC/teacher commands enable W&B and use actual environment steps:
 Generated results stay under the external artifact root, not in the Git
 checkout. R&D's student phase is offline and therefore records distillation
 update count/time rather than pretending those updates are environment
-interactions. Its launcher first trains or reuses every required single-task
-teacher and rollout, then starts distillation only if the prerequisite queue
-finishes without failures.
+interactions. After the non-R&D queue succeeds, the R&D stage trains or reuses
+every required single-task teacher and rollout, then starts distillation only
+if the teacher prerequisite queue finishes without failures.
 
 ### Shared baseline / Clip evaluation and task banks
 
@@ -259,9 +290,11 @@ Use a fresh artifact root for the corrected baseline batch; rerunning a main
 queue does not resume training or skip completed baseline runs and can overwrite
 their logs. Compatible teacher caches may be imported into that new root.
 Both machines still use the same launcher commands shown above; regenerate
-prepared queues after updating the code.
+prepared queues after updating the code. Use the new ordering for a batch that
+has not started.
+Do not overwrite manifests for an active batch or rerun completed runs blindly.
 
-Validation after the cache-reuse update in `reset-distill` on CPU: 39 distinct
+Earlier validation after the cache-reuse update in `reset-distill` on CPU: 39 distinct
 regression checks passed across the targeted test runs. The eight queue/cache
 checks include reuse without a receipt, missing-file branches, task/seed/budget
 filename mismatches, and both launchers' prepare/dry-run paths. Environment and
@@ -273,6 +306,14 @@ and seen-task evaluation with tiny synthetic teacher artifacts. Both machine
 queues passed prepare/dry-run and all 168 baseline/teacher commands parsed,
 including output paths containing spaces. This is **not** a full 1.5M-step
 teacher/student experiment or a full-size two-process-per-V100 memory test.
+
+The staged launchers passed all nine queue/cache tests, including automatic
+non-R&D → teacher → student order and stop-before-next-phase behavior using a
+stub queue, local teacher coverage without cross-host duplication, phase-file
+partitions, dry-runs, and parsing all 168 commands (105 baseline + 63 teacher
+jobs). Main-run/teacher training commands and machine assignments match the
+cache-reuse version; only execution staging changed. No formal training was
+started by these checks.
 
 ## Clip (ours): E4 full-sequence queue
 

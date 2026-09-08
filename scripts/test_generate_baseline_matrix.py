@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -66,6 +67,7 @@ class BaselineMatrixChecks(unittest.TestCase):
 
     def test_rnd_prerequisites_are_explicit_and_reusable(self):
         teacher_counts = {}
+        teacher_sets = []
         for machine in (1, 2):
             selected = [job for job in self.jobs
                         if job['machine'] == machine]
@@ -76,6 +78,13 @@ class BaselineMatrixChecks(unittest.TestCase):
             identities = {(job['env_type'], job['task'], job['seed'])
                           for job in teachers}
             self.assertEqual(len(teachers), len(identities))
+            required = {(job['env_type'], task, job['seed'])
+                        for job in selected if job['method'] == 'rnd'
+                        for task in job['tasks']}
+            self.assertEqual(identities, required)
+            self.assertEqual({teacher['env_type'] for teacher in teachers},
+                             {'metaworld'} if machine == 1 else {'dm_control'})
+            teacher_sets.append(identities)
             for teacher in teachers:
                 self.assertIn('TEACHER_REUSE', teacher['command'])
                 self.assertIn('--bellman_probe True', teacher['command'])
@@ -94,6 +103,8 @@ class BaselineMatrixChecks(unittest.TestCase):
                 self.assertIn('--rd_teacher_root /tmp/baseline-artifacts/teachers ',
                               job['command'])
         self.assertEqual({1: 48, 2: 15}, teacher_counts)
+        self.assertFalse(teacher_sets[0] & teacher_sets[1])
+        self.assertEqual(len(teacher_sets[0] | teacher_sets[1]), 63)
 
     def test_teacher_cache_shell_reuses_pair_without_receipt(self):
         for present in (('model_path', 'rollout_path'), ('model_path',),
@@ -167,6 +178,13 @@ class BaselineMatrixChecks(unittest.TestCase):
                     'baseline_jobs_machine_{}.json'.format(machine)).read_text())
                 self.assertEqual(len(manifest['jobs']), job_count)
                 self.assertEqual(len(manifest['teacher_prerequisites']), teacher_count)
+                non_rnd_count, rnd_count = (44, 9) if machine == 1 else (46, 6)
+                self.assertEqual(manifest['schema_version'], 4)
+                self.assertEqual(manifest['phase_job_counts'], {
+                    'non_rnd': non_rnd_count, 'rnd_teachers': teacher_count,
+                    'rnd_students': rnd_count})
+                self.assertEqual([phase['id'] for phase in manifest['execution_phases']],
+                                 ['non_rnd', 'rnd_teachers', 'rnd_students'])
                 self.assertEqual(manifest['teacher_cache_policy'],
                                  'existing_model_rollout_pair_no_receipt_required')
                 for job in manifest['jobs'] + manifest['teacher_prerequisites']:
@@ -184,6 +202,8 @@ class BaselineMatrixChecks(unittest.TestCase):
                         self.assertEqual(args.rd_teacher_root, str(root / 'teachers'))
                     parsed_count += 1
                 for prefix, count in (('baseline_jobs', job_count),
+                                      ('baseline_non_rnd', non_rnd_count),
+                                      ('baseline_rnd', rnd_count),
                                       ('baseline_prerequisites', teacher_count)):
                     result = subprocess.run(
                         ['bash', str(self.repo / 'scripts' / 'run_two_per_gpu_queue.sh'),
@@ -195,9 +215,63 @@ class BaselineMatrixChecks(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertIn('SHARD 0/1: {} of {} jobs'.format(count, count),
                                   result.stdout)
+                for prefix, is_rnd in (('baseline_non_rnd', False), ('baseline_rnd', True)):
+                    commands = (root / 'manifests' /
+                        '{}_machine_{}.txt'.format(prefix, machine)).read_text().splitlines()
+                    commands = [c for c in commands if c and not c.startswith('#')]
+                    self.assertEqual(commands, [j['command'] for j in manifest['jobs']
+                                                if (j['method'] == 'rnd') == is_rnd])
                 self.assertFalse((root / 'runs').exists())
                 self.assertFalse((root / 'teachers').exists())
         self.assertEqual(parsed_count, 168)
+
+    def test_launchers_run_non_rnd_before_teachers_and_distillation(self):
+        environment = dict(os.environ)
+        environment['PATH'] = str(Path(sys.executable).parent) + os.pathsep + environment['PATH']
+        for machine in (1, 2):
+            for failure in ('none', 'non_rnd', 'prerequisites', 'rnd'):
+                with self.subTest(machine=machine, failure=failure), \
+                        tempfile.TemporaryDirectory() as directory:
+                    scripts = Path(directory) / 'stub repo' / 'scripts'
+                    scripts.mkdir(parents=True)
+                    launcher = 'run_baselines_machine_{}.sh'.format(machine)
+                    for name in (launcher, 'generate_baseline_matrix.py'):
+                        shutil.copy2(str(self.repo / 'scripts' / name), str(scripts / name))
+                    # Record real launcher stage invocations, but never execute
+                    # generated training commands or initialize CUDA / W&B.
+                    (scripts / 'run_two_per_gpu_queue.sh').write_text(
+                        '#!/usr/bin/env bash\nset -euo pipefail\n'
+                        'jobs=""; slots=""; gpus=""\n'
+                        'while (($#)); do\n'
+                        '  case "$1" in\n'
+                        '    --jobs-file) jobs=$2 ;;\n'
+                        '    --slots-per-gpu) slots=$2 ;;\n'
+                        '    --gpus) gpus=$2 ;;\n'
+                        '  esac\n'
+                        '  shift 2\n'
+                        'done\n'
+                        '[[ $slots == 2 && $gpus == 0,1,2,3,4,5,6,7 ]] || exit 9\n'
+                        'basename "$jobs" >> "$BASELINE_TEST_TRACE"\n'
+                        'case "$jobs" in\n'
+                        '  *"baseline_${BASELINE_TEST_FAIL}_machine_"*) exit 7 ;;\n'
+                        'esac\n')
+                    trace = Path(directory) / 'stage trace'
+                    env = dict(environment, BASELINE_TEST_TRACE=str(trace),
+                               BASELINE_TEST_FAIL=failure)
+                    result = subprocess.run(
+                        ['bash', str(scripts / launcher),
+                         str(Path(directory) / 'artifacts with spaces'), '--run'],
+                        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        universal_newlines=True, timeout=15)
+                    phases = ['non_rnd', 'prerequisites', 'rnd']
+                    failed = failure in phases
+                    if failed:
+                        phases = phases[:phases.index(failure) + 1]
+                    expected = ['baseline_{}_machine_{}.txt'.format(phase, machine)
+                                for phase in phases]
+                    self.assertEqual(result.returncode, 7 if failed else 0,
+                                     result.stderr)
+                    self.assertEqual(trace.read_text().splitlines(), expected)
 
 
 if __name__ == '__main__':
