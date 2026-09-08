@@ -166,10 +166,10 @@ Meta-World 名称在配置中统一使用 `-v2` 后缀。
 | FT | 普通 SAC 连续微调 | 统一主序列入口与记录协议 |
 | Reset | critic-only Q reset，并重置 critic Adam | 已实现 optimizer reset；保留正式边界验收 |
 | EWC | 原版 EWC，不叠加 Clip | 固定 Fisher、正则参数范围和系数记录 |
-| P&C | EWC-compression 的 Progress & Compress；任务后重置 active column 与 adaptor | 正式开关已固定；异构 DMC-style observation/action spec 上的 SAC 更新 smoke 已通过 |
+| P&C | EWC-compression 的 Progress & Compress；任务后重置 active column 与 adaptor | 采样/训练/评估/压缩共用固定旧 KB 侧向连接；压缩目标不随 live KB 更新漂移；状态随 Bellman checkpoint 保存 |
 | Spectral regularization | k=2；每层 $(\sigma_{\max}(W)^2-1)^2+\lVert b\rVert_2^4$；actor/双 online critic 均取 1e-4；多 head actor 只正则共享层与当前任务 mean/log-std heads，不改未激活 heads | 已有 `--cl_method spectral` 与单步 power iteration；完成 DMC 环境 smoke test，不能以 hard clip 代替 |
 | ReDo | 每 1k task-local 环境步按归一化平均绝对激活（tau=0.1）识别 dormant neurons；重置 incoming、清零 outgoing、清除对应 Adam moments，并同步双 target Q | 周期实现与单元测试已完成；正式长程前保留短程 Meta-World/DMC smoke |
-| R&D | reset-and-distill teacher/student 管线 | 双机脚本先生成/复用同 seed、1.5M 单任务 teacher model+rollout，再通过固定绝对路径启动离线 student；DMC 异构输入切片和任务 head 映射已有单元测试 |
+| R&D | reset-and-distill teacher/student 管线 | 双机脚本先生成/复用同配置、同 seed、1.5M teacher 与训练 bank rollout；完成标记仅作可选追溯；student 每阶段仅评估已见 head，单独记录蒸馏时钟 |
 | Clip（ours） | 第二任务起的 critic 双侧谱裁剪 | 主序列入口已支持 MW/DMC、环境时钟、所有后续任务入口及现有 probes；E2 同源 checkpoint 分支和完整 E0 数据契约仍待补 |
 
 所有方法在 F1、F2、F3、D-W6、D-C4 上运行 seeds 1、2、3，共 8×5×3=120 个序列配置。按任务数计的名义训练预算为 1.44B 环境交互步，其中 R&D 的 teacher 预算已包含在内；student 的离线蒸馏不伪装成额外在线学习曲线。
@@ -188,7 +188,7 @@ E1/E2 的短序列测试入口。每条序列 seeds 1/2/3，共 **15 runs、120 
 1k 标量、10k feature/weight/Hessian、100k Bellman，以及原固定谱诊断关键点。
 
 启动与 `--prepare-only` 命令见 README 的 Clip 节；GPU 列表可配置，每卡两个进程自动
-接续。此处配置完成不表示 E0 全部验收：完整恢复、实例 bank、入口评估、逐 episode
+接续。此处配置完成不表示 E0 全部验收：完整恢复、入口评估、完整逐 episode
 原始记录与干预前后 Q-jump 等仍按 §3/论文 §6 补齐。旧日志保持旧协议身份，不能改标签。
 
 本次验证：33 项仓库测试通过，含 Clip 调度/预算/状态保持/重复 head 回归，以及 CPU
@@ -203,7 +203,21 @@ V100 长程训练未在此验证中执行；队列只做了生成和 dry-run，�
 
 所有在线 SAC/teacher 命令显式使用 `--wandb True` 与 50 evaluation episodes。loss、reward、alpha、speed、zero ratio 每 1k 环境步；feature rank、weight change 每 10k；Hessian rank 每 10k 且在同一模型状态后进行 10k evaluation；Bellman probe 每 100k。`--no_stats False` 打开这些统计；诊断和评估前后恢复 Python/NumPy/Torch/CUDA RNG。full-Jacobian Bellman spectral stats 固定在 10k、50k、100k、500k、1M、1.5M，不改成等间隔扫描。probe/checkpoint 与所有生成结果写入仓库外的 run 独立目录。
 
-R&D manifest 仍标记 `requires_teacher_artifacts=true`，但依赖不再留给人工处理。每台机器先运行 `baseline_prerequisites_machine_N.txt`：完整的 model+rollout 对存在时复用，否则按相同 seed 和 1.5M 预算训练单任务 teacher；前置队列全部成功后才运行 `baseline_jobs_machine_N.txt`。student 通过 `--rd_teacher_root` 读取显式根目录；Meta-World 与 DMC 使用各自与 `make_log_name` 一致的文件名，DMC teacher 的局部输入权重映射到序列网络对应输入切片并写入对应 occurrence head。
+R&D manifest 仍标记 `requires_teacher_artifacts=true`，但依赖不再留给人工处理。每台机器先运行 `baseline_prerequisites_machine_N.txt`：按 env type、task、1.5M 预算和 seed 命名的 model、rollout 均存在时复用，否则训练单任务 teacher 并导出；前置队列全部成功后才运行 `baseline_jobs_machine_N.txt`。student 通过 `--rd_teacher_root` 读取显式根目录 `<ARTIFACT_ROOT>/teachers/`。新导出的 `complete_<teacher-stem>.json` 仅作可选追溯，不再作为复用前提，也不因缺少它就强制重训。Meta-World 与 DMC 使用各自与 `make_log_name` 一致的文件名，DMC teacher 的局部输入权重映射到序列网络对应输入切片并写入对应 occurrence head。
+
+R&D 保留原方法的独立单任务专家训练、训练结束后新采集专家 rollout、结合历史任务记忆进行顺序蒸馏的流程；不是拿训练 replay buffer 替换专家 rollout。默认额外采集 1M observations，采集交互与 1.5M teacher 在线训练预算分开记账。五条序列、1.5M 预算和独立训练/评估 bank 是本文所有方法共用的实验设置，不声称逐项照搬原论文实验。rollout 只在训练 bank 上采集，不用独立评估 bank 训练 student。
+
+旧缓存允许在配置一致时复用。导入前核对环境/依赖版本、观测动作处理、网络结构、Adam 训练设置、seed、包含 warm-up 的 1.5M 预算、任务实例划分与 rollout 来源。队列只检查文件名和两个文件是否存在，不自动校验完整配置、文件完整性或训练是否完整；同名不等于兼容，旧 3M 或旧单实例 teacher 不可冒充同协议结果。曾存放在 `teachers/fixed-task-banks-v1/` 的同配置缓存可核对后复制到上述目录；脚本不自动搜索、迁移或删除旧文件。更新代码后重新生成队列。
+
+### 6.2.3 Baseline 与 Clip 共用评估实现（2026-09-08 修订）
+
+所有在线 baseline 与 Clip 统一调用 `MTSAC._evaluate_policy`，遵循 §1：任务内仅评估当前位置，任务出口评估全部已见位置，绝不评估未来 head。P&C 对旧任务使用 KB、当前任务使用 active column；R&D 在每个离线 student 阶段完成后评估已见位置，环境时钟不因蒸馏增长。DMC 不再把各任务挤进同一个 `Evaluation` key。
+
+正式 exact-budget SAC 自动使用 `fixed-task-banks-v1`。MW 按 task name/seed 分别生成 50 个训练实例与 50 个无交集评估实例，训练采用私有 RNG 均匀抽样；评估每轮从固定实例 0–49 开始。DMC 训练/评估环境隔离，每轮重复固定 50 个 evaluation reset seeds。bank 不依赖 method/stream/occurrence，单任务 teacher 与序列模型共享相同划分。`task_banks/` 保存 pickle、reset seeds 与 SHA-256 manifest；`eval_episodes.jsonl` 保存实际 clocks、位置/head/role、episode return/success/length 和 instance/reset seed。确定性评估直接取均值，并恢复训练 RNG。
+
+新批次应使用新 artifact root，不混用修订前曲线。baseline 主队列仍不支持断点续训或自动跳过已完成 runs。上述修改不代表完整 E0、V100 满尺寸双进程显存及长程数值稳定性已全部验收。
+
+本次缓存复用修订后的 CPU 验证：分组执行的 39 项不同回归检查通过。8 项队列/缓存测试覆盖无完成标记的成对文件复用、文件缺失时训练分支、任务/seed/预算文件名不匹配、双机 prepare/dry-run；全部 168 条 baseline/teacher 命令参数与含空格路径均通过检查。环境与算法测试覆盖六种在线 baseline 的真实 DMC 两任务/4k 步训练（小网络，含 Hessian/Bellman）、真实 MW 独立实例 bank 与重放、DMC 50 个固定 reset、teacher rollout 仅使用训练 bank、R&D 小型合成 artifacts 加载及逐阶段已见任务评估、Clip 时钟/入口以及 P&C 等定向检查。未运行正式 1.5M teacher/student 实验或 V100 满尺寸双进程压力测试。
 
 ### 6.3 主结果指标
 

@@ -363,18 +363,19 @@ class CLTaskSampler(TaskSampler):
 
     """
 
-    def __init__(self, benchmark, steps_per_env, seed, env_type='metaworld', wrapper=None, exploration_steps = 0):
+    def __init__(self, benchmark, steps_per_env, seed, env_type='metaworld', wrapper=None, exploration_steps = 0, bank_dir=None):
         self._benchmark = benchmark
         self._steps_per_env = steps_per_env
         self.seed = seed
         self._env_type = env_type
         self._inner_wrapper = wrapper
         self._exploration_steps = exploration_steps
+        self._bank_dir = bank_dir
         
         
         self._task_indices = {}
         
-        if self._env_type == 'metaworld':
+        if self._env_type == 'metaworld' and bank_dir is None:
             self._classes = benchmark.train_classes
             self._tasks = benchmark.train_tasks
             self._task_map = {
@@ -475,6 +476,19 @@ class CLTaskSampler(TaskSampler):
                 See :py:class:`~EnvUpdate` for more information.
 
         """
+
+        if self._bank_dir is not None:
+            from garage.experiment.task_banks import build_task_banks
+            if self._env_type == 'metaworld':
+                names = [self.MT50_ENV_SEQS[i] for i in task_seq_idx]
+            else:
+                names = ['DMControl-{}-{}'.format(*self.DM_CONTROL_ENV_SEQS[i])
+                         for i in task_seq_idx]
+            updates, evaluation = build_task_banks(
+                self._env_type, names, self.seed, self._bank_dir)
+            train = ContinualLearningEnv(updates, self._env_type,
+                self._steps_per_env, self.seed, self._exploration_steps)
+            return [train], evaluation
 
         updates = []
 

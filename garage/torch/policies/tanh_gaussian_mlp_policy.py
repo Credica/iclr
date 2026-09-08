@@ -142,6 +142,13 @@ class TanhGaussianMLPPolicy(StochasticPolicy):
             dict[str, torch.Tensor]: Additional agent_info, as torch Tensors
 
         """
+        # P&C must use the same frozen lateral source in optimization,
+        # sampling, evaluation, Bellman targets, and compression targets.
+        knowledge_base = getattr(self, '_knowledge_base', None)
+        if knowledge_base is not None and features is None and int(seq_idx) > 0:
+            with torch.no_grad():
+                knowledge_base(observations, seq_idx)
+                features = knowledge_base._features
         if self._multi_input:
             if isinstance(seq_idx, int):
                 zero_pad = self._zero_pad_per_task[seq_idx]
@@ -175,4 +182,17 @@ class TanhGaussianMLPPolicy(StochasticPolicy):
     def reset_parameter(self, column=True, adaptor=False):
         self._module.reset_parameter(column=column, adaptor=adaptor)
 
+    def set_knowledge_base(self, policy):
+        # Deliberately not an nn.Module child: the KB has its own optimizer
+        # and checkpoint. Active-column parameters/state_dict stay unchanged.
+        object.__setattr__(self, '_knowledge_base', policy)
+
+    def get_deterministic_action(self, observation, seq_idx):
+        from garage.torch import global_device
+        with torch.no_grad():
+            obs = torch.as_tensor(observation, dtype=torch.float32,
+                                  device=global_device()).reshape(1, -1)
+            dist, info = self(obs, seq_idx)
+            return dist.mean[0].cpu().numpy(), {
+                key: value[0].detach().cpu().numpy() for key, value in info.items()}
 

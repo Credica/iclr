@@ -47,10 +47,12 @@ D-W6/D-C4 是本研究固定的 DMC 持续任务顺序。H8/E8/CW20/ABC/RPP 不�
 | P&C | Progress & Compress：active column 学习当前任务，再蒸馏到 knowledge base；compression 用 EWC 保护旧知识，不加 Clip | 正式配置固定 `use_pandc_bc=False, reset_column=True, reset_adaptor=True`；异构 DMC-style spec SAC 更新 smoke 已通过 |
 | Spectral regularization | ICLR 2025 的 k=2 layer spectral regularizer；actor 与双 online critic 系数均为 1e-4；多 head actor 只作用共享层与当前 mean/log-std heads，不改未激活 heads；不以 hard clip 冒充 | 已实现 `--cl_method spectral`，使用不消耗训练 RNG 的单步 power iteration；需完成统一协议 smoke test |
 | ReDo | Recycling Dormant Neurons：每 1k task-local 环境步按归一化平均绝对激活和固定 tau=0.1 回收；重采样 incoming、清零 outgoing；覆盖 actor 与双 critic | 已实现受影响 Adam moments 清理、双 target Q 同步与事件记录；固定配置，不做阈值/频率扫描 |
-| R&D | 完整 reset-and-distill，包括本任务 teacher 与部署 student | 双机 staged queue 先生成/复用相同 seed、1.5M teacher model+rollout；student 使用显式 artifact root；DMC 异构输入/head 映射已有单元测试 |
+| R&D | 完整 reset-and-distill，包括本任务 teacher 与部署 student | 双机 staged queue 先生成/复用同配置、同 seed、1.5M teacher model+rollout，不强制要求新完成标记；student 使用显式 artifact root；DMC 异构输入/head 映射已有单元测试 |
 | Clip（ours） | 第二任务起的 critic 双侧谱裁剪；具体定义见 §4.1 | MW/DMC 完整主序列、环境时钟、后续各入口和现有 probes 已接入；E2 分支及完整数据契约仍待补 |
 
 P&C 主实验固定使用论文的 EWC compression 路径，不使用仓库可选的 BC compression 变体。每次完成 compression 后重置 active column 及 adaptor；knowledge base、Fisher、compression optimizer 和已见任务计数都属于必须保存的方法状态。[P&C 原论文](https://proceedings.mlr.press/v80/schwarz18a.html)。
+
+R&D 保留原方法的单任务专家训练、训练结束后额外采集专家 rollout、结合历史任务记忆进行顺序蒸馏的流程。五条任务流、1.5M 在线预算和训练/评估实例划分采用本文统一设置，不声称逐项复现原论文实验配置。蒸馏轨迹来自训练 bank，不使用独立评估 bank，也不改用训练 replay buffer。teacher 缓存可复用；队列只按任务/预算/seed 文件名检查 model+rollout 是否齐全，不要求新 completion receipt。完整配置一致性须在导入缓存前另行核对，不能仅凭文件名认定兼容。
 
 Reset 在这里不是 actor+critic 全重置，也不是 R&D。权重+Adam 的正式定义沿用上一版计划；本轮不新增一个 weights-only 训练组，旧 weights-only 结果仅作为历史结果标注。
 

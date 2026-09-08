@@ -7,6 +7,7 @@ import shlex
 
 
 METHODS = ('ft', 'reset', 'ewc', 'pandc', 'spectral', 'redo', 'rnd')
+TASK_BANK_PROTOCOL = 'fixed-task-banks-v1'
 
 SEQUENCES = {
     'F1': {
@@ -150,6 +151,10 @@ def teacher_prerequisites(repo, artifact_root, selected_jobs):
                 '--cl_method', 'finetuning',
             ]
             launch = ' '.join(shlex.quote(part) for part in command)
+            # Match the upstream pretrained-model/rollout workflow. Completion
+            # receipts are optional provenance, not a new algorithm requirement.
+            # Filenames match task/budget/seed, not the full training protocol;
+            # users must verify imported caches as documented in README.
             shell = (
                 'mkdir -p {root} && cd {root} && '
                 'if test -f {model} && test -f {rollout}; '
@@ -167,6 +172,9 @@ def teacher_prerequisites(repo, artifact_root, selected_jobs):
                 'seed': seed,
                 'model_path': str(model_path),
                 'rollout_path': str(rollout_path),
+                'expected_task_bank_protocol': TASK_BANK_PROTOCOL,
+                'cache_match': 'env_task_budget_seed_filenames_and_pair_exists',
+                'cache_configuration_check': 'not_automatic_operator_must_verify_imports',
                 'command': shell,
             }
     return list(teachers.values())
@@ -237,11 +245,11 @@ def main():
         '# Generated baseline commands for machine {}. Do not reorder.\n{}'.format(
             args.machine, ''.join(job['command'] + '\n' for job in selected)))
     args.prerequisite_jobs_file.write_text(
-        '# R&D single-task teachers for machine {}. Completed artifacts are reused.\n{}'.format(
+        '# R&D single-task teachers for machine {}. Existing pairs are reused; verify imported cache configuration first.\n{}'.format(
             args.machine,
             ''.join(job['command'] + '\n' for job in prerequisites)))
     args.manifest.write_text(json.dumps({
-        'schema_version': 2,
+        'schema_version': 3,
         'status': 'staged_queue_prepared',
         'machine': args.machine,
         'total_global_jobs': 105,
@@ -249,6 +257,9 @@ def main():
         'methods': list(METHODS),
         'sequences': list(SEQUENCES),
         'sac_optimizer': 'adam',
+        'task_bank_protocol': TASK_BANK_PROTOCOL,
+        'teacher_cache_policy': 'existing_model_rollout_pair_no_receipt_required',
+        'evaluation_protocol': 'current_every_10k_seen_at_exit_position_keyed',
         'excluded_optimizers': ['muon'],
         'recording_cadence_environment_steps': {
             'loss_reward_alpha_speed_zero_ratio': 1000,

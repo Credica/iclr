@@ -62,6 +62,9 @@ class RND_SAC(MTSAC):
 
         tasknum = len(self._eval_env)
         global_step = 0
+        self._distillation_updates = 0
+        self._learner_role = 'rnd_offline_student'
+        self.seq_idx = 0
 
         target_task_name = self._env_seq[0]
         
@@ -75,14 +78,17 @@ class RND_SAC(MTSAC):
         self.load_target_policy_and_buffer(0, self._replay_buffer_size)
         evaluation_rng_state = _capture_training_rng_state()
         try:
-            last_return = self._evaluate_policy(trainer.step_itr)
+            last_return = self._evaluate_policy(trainer.step_itr, at_boundary=True)
         finally:
             _restore_training_rng_state(evaluation_rng_state)
         self.on_task_start(0)
+        self.save_results()
+        trainer.step_itr += 1
 
         task_list = list(range(1,tasknum))
 
         for seq_idx in task_list:
+            self.seq_idx = seq_idx
             target_policy = self.load_target_policy_and_buffer(seq_idx, self._replay_buffer_size)
             total_observations, total_target_means, total_target_log_stds = self.make_single_task_targets(target_policy, seq_idx)
             num_iter = 0
@@ -126,6 +132,7 @@ class RND_SAC(MTSAC):
                     end_time = time()
 
                     global_step += 1
+                    self._distillation_updates = global_step
 
                     if global_step % 1000 == 0:
                         if self._use_wandb:
@@ -150,12 +157,13 @@ class RND_SAC(MTSAC):
                 
             evaluation_rng_state = _capture_training_rng_state()
             try:
-                last_return = self._evaluate_policy(trainer.step_itr)
+                last_return = self._evaluate_policy(trainer.step_itr, at_boundary=True)
             finally:
                 _restore_training_rng_state(evaluation_rng_state)
             self.save_results()
             
             self.on_task_start(seq_idx)
+            trainer.step_itr += 1
 
         return np.mean(last_return)
                 

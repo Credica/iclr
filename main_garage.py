@@ -19,6 +19,8 @@ from dm_control import suite
 from garage.algo_factory import get_algo
 
 import os
+import json
+from pathlib import Path
 import wandb
 from sklearn.utils import shuffle
 
@@ -106,21 +108,26 @@ _gpu = args.device_type
 seed = args.seed
 set_seed(seed)
 specs = None
+record_dir = Path(args.bellman_probe_dir) / args.proc_name
+bank_dir = (record_dir / 'task_banks'
+            if args.rl_method == 'sac' and args.exact_sac_task_budget else None)
+if bank_dir is not None and not 1 <= args.num_evaluation_episodes <= 50:
+    raise ValueError('Fixed-bank SAC evaluation requires 1 to 50 episodes (formal: 50)')
 
 if args.env_type == 'metaworld':
     
-    mt50 = metaworld.MT50(seed=args.seed)
+    mt50 = metaworld.MT50(seed=args.seed) if bank_dir is None else None
     total_steps = _steps_per_task+START_STEPS if args.rl_method == 'sac' else _steps_per_task
     print(args.use_exploration)
-    task_sampler = CLTaskSampler(mt50, total_steps, seed, env_type='metaworld', wrapper=lambda env, _: normalize(env), exploration_steps= int(1e4) if args.use_exploration else 0)
+    task_sampler = CLTaskSampler(mt50, total_steps, seed, env_type='metaworld', wrapper=lambda env, _: normalize(env), exploration_steps= int(1e4) if args.use_exploration else 0, bank_dir=bank_dir)
     n_tasks = len(task_seq_idx)
     train_envs, test_envs = task_sampler.sample(task_seq_idx)
 
-    env = test_envs[0]()
     test_envs = [env_up() for env_up in test_envs]
+    env = test_envs[0]
 
 elif args.env_type == 'dm_control':
-    task_sampler = CLTaskSampler(None, _steps_per_task+START_STEPS, seed, env_type='dm_control', wrapper=lambda env: normalize(env))
+    task_sampler = CLTaskSampler(None, _steps_per_task+START_STEPS, seed, env_type='dm_control', wrapper=lambda env: normalize(env), bank_dir=bank_dir)
     n_tasks = len(task_seq_idx)
     train_envs, test_envs = task_sampler.sample(task_seq_idx)
     env = test_envs[0]
@@ -193,6 +200,9 @@ algo = get_algo(
     )
 
 algo.to()
+algo._evaluation_dir = record_dir
+if args.save_single_task_artifacts:
+    algo._learner_role = 'rnd_teacher'
 trainer.setup(algo=algo, env=train_envs)
 trainer.train(n_epochs=epochs, batch_size=batch_size)
 
@@ -206,3 +216,14 @@ if (len(env_seq) == 1 and
             algo.save_buffers(log_name=log_name)
         algo.save_rollouts(log_name=log_name)
         algo.save_results(log_name=log_name)
+        if args.rl_method == 'sac' and bank_dir is not None:
+            # Optional provenance for checking the training budget and banks.
+            # Write it last and atomically, but do not require it for cache reuse.
+            receipt = Path('models/sac_models') / ('complete_' + log_name + '.json')
+            temporary = receipt.with_suffix('.json.tmp')
+            temporary.write_text(json.dumps(dict(
+                protocol='fixed-task-banks-v1', seed=args.seed,
+                training_environment_steps=algo.global_env_step,
+                rollout_bank='train', task_banks=json.loads(
+                    (bank_dir / 'manifest.json').read_text())), indent=2) + '\n')
+            temporary.replace(receipt)

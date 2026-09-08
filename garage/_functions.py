@@ -120,9 +120,12 @@ def rollout(env,
     while episode_length < (max_episode_length or np.inf):
         if pause_per_frame is not None:
             time.sleep(pause_per_frame)
-        a, agent_info = agent.get_action(last_obs, seq_idx)
-        if deterministic and 'mean' in agent_info:
-            a = agent_info['mean']
+        if deterministic and hasattr(agent, 'get_deterministic_action'):
+            a, agent_info = agent.get_deterministic_action(last_obs, seq_idx)
+        else:
+            a, agent_info = agent.get_action(last_obs, seq_idx)
+            if deterministic and 'mean' in agent_info:
+                a = agent_info['mean']
         es = env.step(a)
         env_steps.append(es)
         observations.append(last_obs)

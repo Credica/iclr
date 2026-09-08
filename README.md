@@ -167,8 +167,10 @@ domain-aware allocation avoids duplicating most R&D teachers across the two
 hosts: machine 1 prepares all 48 Meta-World teacher/task/seed artifacts and
 machine 2 prepares all 15 DMC artifacts, with no teacher duplicated across
 hosts. Each launcher first runs its generated teacher prerequisite queue, reuses
-already complete model+rollout pairs, and starts the baseline queue only after
-all prerequisites succeed.
+existing model+rollout pairs with matching task/budget/seed filenames (no
+completion receipt required), and starts the baseline queue only after all
+prerequisites succeed. Imported caches must also match the training configuration;
+see the R&D compatibility notes below.
 
 All online SAC/teacher commands enable W&B and use actual environment steps:
 
@@ -177,7 +179,7 @@ All online SAC/teacher commands enable W&B and use actual environment steps:
 | Loss, reward, alpha, training speed, zero ratio | 1,000 environment steps |
 | Feature rank and weight change | 10,000 environment steps |
 | Hessian rank | 10,000 environment steps, immediately before the matching evaluation |
-| Evaluation | 10,000 environment steps, 50 episodes |
+| Evaluation | Current task every 10,000 environment steps; all seen positions at task exit; 50 episodes per evaluated position |
 | Bellman probe | 100,000 environment steps |
 | Full Bellman spectral statistics | Fixed points: 10k, 50k, 100k, 500k, 1M, 1.5M |
 
@@ -187,6 +189,90 @@ update count/time rather than pretending those updates are environment
 interactions. Its launcher first trains or reuses every required single-task
 teacher and rollout, then starts distillation only if the prerequisite queue
 finishes without failures.
+
+### Shared baseline / Clip evaluation and task banks
+
+All seven baselines and Clip now use the same `MTSAC._evaluate_policy` implementation.
+There is no future-task evaluation. Task-exit evaluation happens before the next
+task's reset/Clip intervention. Revisited tasks retain distinct position/head
+keys, `test/<zero-based-position>/<task-name>/`; each curve includes environment
+clocks. P&C evaluates past tasks with its knowledge base and the current task
+with its active column. R&D evaluates all seen student heads after each offline
+stage and records distillation updates separately from online environment steps.
+
+Formal `--exact_sac_task_budget True` SAC runs, including teachers and Clip,
+automatically enable `fixed-task-banks-v1`:
+
+- Meta-World: 50 training instances and an independently generated, disjoint
+  50-instance evaluation bank per task/seed. Training samples the training bank
+  using a private RNG. Each evaluation round restarts the same ordered 50
+  held-out instances and reset seeds.
+- DMC: independent training/evaluation environments and private reset RNGs;
+  the same fixed list of 50 evaluation reset seeds is restarted each round.
+- Banks depend on task name and seed, not method, machine, stream, or revisit
+  position. One-task teachers and sequence learners therefore share the same
+  train/evaluation split. Banks, reset seeds and SHA-256 hashes are saved in
+  `task_banks/manifest.json` and task-specific pickle files under the run's
+  recording directory. `eval_episodes.jsonl` records individual returns,
+  lengths, success when available, positions, heads, learner roles and reset
+  identities. Training RNG state is preserved across evaluation.
+
+P&C now uses a frozen previous-knowledge-base lateral source consistently in
+sampling, optimization, evaluation, Bellman targets and compression targets.
+Compression updates the live knowledge base, not this frozen source; the source
+is refreshed only after compression. Its knowledge-base, frozen-source, Fisher
+and optimizer states are included in Bellman checkpoints.
+
+R&D follows the upstream single-task expert training, fresh expert rollout, and
+sequential student-distillation workflow, including memory from previously seen
+tasks. It does **not** replace expert rollouts with the teacher's training replay
+buffer. After teacher training, the default export collects 1M observations for
+distillation; these extra interactions are separate from the 1.5M online-training
+budget. See the [original method, Section 4 and Appendix H](https://arxiv.org/html/2403.05066#S4)
+and the [upstream pretrained-model/rollout workflow](https://github.com/hongjoon0805/Reset-Distill#singe-task-experiment).
+Our task sequences, 1.5M budget, and shared train/evaluation banks are explicit
+experimental settings, not claims of an exact reproduction of the original
+paper's experiment configuration. Expert rollouts use the **training** bank;
+the independent evaluation bank is never used to train the student.
+
+Teacher artifacts use the original-style layout under `<ARTIFACT_ROOT>/teachers/`:
+
+- Model: `models/sac_models/policy_<env-type>_sac_<task>_1500000_<seed>.pt`.
+- Rollout: `rollouts/sac_rollouts/rollouts_<env-type>_sac_<task>_1500000_<seed>.pkl`.
+- Both files present: reuse; either missing: run the single-task teacher/export
+  prerequisite. `models/sac_models/complete_<teacher-stem>.json` is optional
+  provenance written after new exports, **not** a condition for reuse.
+
+Before importing old caches, verify the environment/dependency versions,
+observation/action processing, network configuration, Adam training settings,
+seed, 1.5M budget (including warm-up), task-instance split, and rollout source.
+The queue checks filenames and file presence only; it does **not** validate
+these configurations, file integrity, or training completion. Missing metadata
+does not by itself mean the teacher must be retrained, but matching filenames
+alone do not establish compatibility. Old 3M or single-instance teachers are
+not valid same-protocol substitutes. If a compatible cache is in the previously
+used `teachers/fixed-task-banks-v1/` directory, verify it and copy the model/rollout
+pair into the layout above; the launcher does not search that directory or move
+or delete old artifacts automatically.
+
+Use a fresh artifact root for the corrected baseline batch; rerunning a main
+queue does not resume training or skip completed baseline runs and can overwrite
+their logs. Compatible teacher caches may be imported into that new root.
+Both machines still use the same launcher commands shown above; regenerate
+prepared queues after updating the code.
+
+Validation after the cache-reuse update in `reset-distill` on CPU: 39 distinct
+regression checks passed across the targeted test runs. The eight queue/cache
+checks include reuse without a receipt, missing-file branches, task/seed/budget
+filename mismatches, and both launchers' prepare/dry-run paths. Environment and
+algorithm checks include real 4k-step/two-task DMC runs for all
+six online baselines (small networks, Hessian and Bellman records), real MW
+bank separation/replay, all 50 DMC evaluation resets, training-bank-only teacher
+rollout export, Clip clock/entry checks, and R&D student loading
+and seen-task evaluation with tiny synthetic teacher artifacts. Both machine
+queues passed prepare/dry-run and all 168 baseline/teacher commands parsed,
+including output paths containing spaces. This is **not** a full 1.5M-step
+teacher/student experiment or a full-size two-process-per-V100 memory test.
 
 ## Clip (ours): E4 full-sequence queue
 
@@ -270,11 +356,11 @@ or skip completed main runs on rerun. No teachers are needed for Clip.
 
 The prepared manifest is a launch plan, not evidence that training completed.
 These fixes do not retroactively relabel old update-clock Clip runs. Full
-checkpoint resumption, instance/reset-seed banks, entry evaluations and the
+checkpoint resumption, entry evaluations and the
 complete paper data schema remain separate E0 checks; see the execution plan
 before treating a batch as final paper evidence.
 
-Validation on 2026-09-08: all 33 repository tests passed in `reset-distill` on
+Earlier Clip validation on 2026-09-08: all 33 repository tests passed in `reset-distill` on
 CPU, including the new Clip tests. They cover 500/1000-step collection clocks
 with simulated sampling/updates over three exact 1.5M-step tasks, preserved
 actor/bias/Adam state, entry hard-sync versus periodic Polyak, the DMC 2×1024
@@ -294,7 +380,9 @@ The first recorded FT batch for the six fixed transfer directions is implemented
 - `scripts/launch_rethink_ft_parallel.py`
 - `scripts/test_rethink_ft_recorded.py`
 
-The full main-study matrix is not yet ready to launch. The remaining implementation and validation gates are listed in `EXPERIMENT_PLAN_20260907.md`; a method name or command-line flag must not be treated as evidence that the final protocol is implemented.
+The launch matrix is implemented. The remaining full-size validation and paper
+E0 gates are listed in `EXPERIMENT_PLAN_20260907.md`; a prepared queue or passing
+small-network test is not evidence of V100 memory capacity or full E0 compliance.
 
 The eight planned main-study methods are FT, critic Reset, EWC, Progress &
 Compress (P&C), Spectral regularization, ReDo, Reset & Distill (R&D), and
@@ -303,8 +391,8 @@ provides a SAC SpectralReg entry point, `--cl_method spectral`, implementing the
 ICLR 2025 k=2 objective on the actor and both online critics with default
 coefficients of `1e-4` and one power iteration. For the multi-head actor, it
 regularizes the shared layers and current task's mean/log-standard-deviation
-heads without modifying inactive task heads. Formal launch commands will be
-documented after the unified runner passes the experiment-plan smoke gates.
+heads without modifying inactive task heads. The two-machine baseline launch
+commands are documented above.
 The `--ReDo True` SAC path recycles neurons every 1k task-local environment
 steps with a fixed normalized mean-absolute-activation threshold of 0.1. It
 reinitializes dormant incoming parameters, zeros their outgoing connections,

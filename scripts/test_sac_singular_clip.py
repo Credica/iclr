@@ -206,7 +206,7 @@ class SingularClipChecks(unittest.TestCase):
         algorithm.global_env_step = 3100000
         environment = SimpleNamespace(cur_seq_idx=2)
         algorithm._sampler = SimpleNamespace(_envs=[environment])
-        module = 'garage.torch.algos.sac_singular_clip.'
+        module = 'garage.torch.algos.mtsac.'
         with patch(module + 'obtain_evaluation_episodes') as obtain, \
                 patch(module + 'log_performance', return_value=[1.]) as log:
             algorithm._evaluate_policy(0)

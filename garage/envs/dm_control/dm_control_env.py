@@ -118,6 +118,11 @@ class DMControlEnv(Environment):
         self._step_cnt = 0
         return first_obs, {}
 
+    def seed(self, seed):
+        """Seed the suite task's private RandomState, not NumPy's global RNG."""
+        self._env.task.random.seed(int(seed))
+        return [int(seed)]
+
     def step(self, action):
         """Steps the environment with the action and returns a `EnvStep`.
 

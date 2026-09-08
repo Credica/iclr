@@ -114,6 +114,11 @@ class P_and_C_SAC(MTSAC, P_and_C):
         self._policy_kb_optimizer = self._optimizer(self.policy_kb.parameters(), lr = self._policy_lr)
         self._policy_kb_optimizer.load_state_dict(state_dict_to(self._policy_kb_optimizer.state_dict(), self.device))
         self.policy_kb_prev = deepcopy(self.policy_kb).to(self.device)
+        for parameter in self.policy_kb_prev.parameters():
+            parameter.requires_grad_(False)
+        # Freeze the progress network's lateral source throughout compression.
+        # Using policy_kb here would move the distillation target on every step.
+        self.policy.set_knowledge_base(self.policy_kb_prev)
         
 
     def _update_fisher_matrix(self, seq_idx):
@@ -208,61 +213,28 @@ class P_and_C_SAC(MTSAC, P_and_C):
                 print('Reset the adaptor')
         self._num_task_seen += 1
 
-    def _evaluate_policy(self, epoch):
-        eval_eps = []
-        for seq_idx, eval_env in enumerate(self._eval_env):
+    def _evaluation_policy_for_position(self, position):
+        if position < self.seq_idx:
+            return self.policy_kb, 'pandc_knowledge_base'
+        return self.policy, 'pandc_active_column'
 
-            self.on_test_start(seq_idx)
+    def pandc_checkpoint_state(self):
+        return dict(knowledge_base=self.policy_kb.state_dict(),
+                    frozen_lateral_source=self.policy_kb_prev.state_dict(),
+                    knowledge_base_optimizer=self._policy_kb_optimizer.state_dict(),
+                    fisher=self._fisher, num_task_seen=self._num_task_seen,
+                    lateral_source='frozen_previous_knowledge_base')
 
-            # Use policy_kb at evaluation step only when current idx > seq idx
-            if self.seq_idx > seq_idx:
-                eps = obtain_evaluation_episodes(
-                    self.policy_kb,
-                    eval_env,
-                    seq_idx,
-                    self._max_episode_length_eval,
-                    num_eps=self._num_evaluation_episodes,
-                    deterministic=self._use_deterministic_evaluation)
-                
-            
-            else:
-                eps = obtain_evaluation_episodes(
-                    self.policy,
-                    eval_env,
-                    seq_idx,
-                    self._max_episode_length_eval,
-                    num_eps=self._num_evaluation_episodes,
-                    deterministic=self._use_deterministic_evaluation)
-            
-            eval_eps.append(eps)
-            self.on_test_end(seq_idx)
-
-            if isinstance(self.env_spec, list):
-                last_return = log_performance(epoch,
-                                      eps,
-                                      discount=self._discount,
-                                      results=self.results, 
-                                      use_wandb=self._use_wandb)
-
-        if not isinstance(self.env_spec, list):
-            eval_eps = EpisodeBatch.concatenate(*eval_eps)
-            last_return = log_multitask_performance(epoch, eval_eps,
-                                                    self._discount,
-                                                    self.results,
-                                                    use_wandb=self._use_wandb)
-        
-        
-        return last_return
+    def to(self, device=None):
+        super().to(device)
+        device = global_device() if device is None else device
+        self.policy_kb.to(device)
+        self.policy_kb_prev.to(device)
+        self._policy_kb_optimizer.load_state_dict(state_dict_to(
+            self._policy_kb_optimizer.state_dict(), device))
     
     def _get_policy_output(self, obs, seq_idx):
-        if seq_idx == 0:
-            kb_features = None
-        else:
-            with torch.no_grad():
-                _ = self.policy_kb(obs, seq_idx)[0]
-                kb_features = self.policy_kb._features
-
-        action_dists = self.policy(obs, seq_idx, features = kb_features)[0]
+        action_dists = self.policy(obs, seq_idx)[0]
         new_actions_pre_tanh, new_actions = (
             action_dists.rsample_with_pre_tanh_value())
         log_pi_new_actions = action_dists.log_prob(
@@ -481,4 +453,3 @@ class P_and_C_PPO(PPO, P_and_C):
                                                     self.results, 
                                                     use_wandb=self._use_wandb)
         return last_return
-    

@@ -11,7 +11,6 @@ import os
 
 import torch
 
-from garage import log_performance, obtain_evaluation_episodes
 from garage.torch.algos.finetuning import Finetuning_SAC
 
 
@@ -145,31 +144,3 @@ class FinetuningSACSingularClip(Finetuning_SAC):
         self._clip_at_task_start(int(seq_idx) + 1)
         self.episode_rewards.clear()
         return result
-
-    def _evaluate_policy(self, epoch):
-        """Current task periodically; all seen occurrences at task exit."""
-        at_boundary = self._sampler._envs[0].cur_seq_idx != self.seq_idx
-        positions = range(self.seq_idx + 1) if at_boundary else [self.seq_idx]
-        current_returns = None
-        for position in positions:
-            self.on_test_start(position)
-            try:
-                episodes = obtain_evaluation_episodes(
-                    self.policy, self._eval_env[position], position,
-                    self._max_episode_length_eval,
-                    num_eps=self._num_evaluation_episodes,
-                    deterministic=self._use_deterministic_evaluation)
-            finally:
-                self.on_test_end(position)
-            # Position, not a unique task name, selects the actor head. DMC
-            # revisit curves must not be merged into the first occurrence.
-            name = self._task_names[position]
-            prefix = 'test/{}/{}/'.format(position, name)
-            returns = log_performance(
-                epoch, episodes, self._discount, self.results,
-                prefix=prefix, use_wandb=self._use_wandb)
-            self.results.setdefault(prefix + 'Global env step', []).append(
-                self.global_env_step)
-            if position == self.seq_idx:
-                current_returns = returns
-        return current_returns

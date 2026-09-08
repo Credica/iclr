@@ -1529,6 +1529,8 @@ class SAC(RLAlgorithm):
             'spectral_regularization': (
                 self.spectral_regularization_checkpoint_state()
                 if self._spectral_regularization_enabled else None),
+            'pandc': (self.pandc_checkpoint_state()
+                      if hasattr(self, 'pandc_checkpoint_state') else None),
         }, checkpoint_path)
 
     def spectral_regularization_checkpoint_state(self):
@@ -2187,10 +2189,7 @@ class SAC(RLAlgorithm):
             log_name = self._log_name
 
         #  Save models into 'models/sac_models'
-        if not os.path.exists('models/'):
-            os.makedirs('models')
-        if not os.path.exists('models/sac_models'):
-            os.makedirs('models/sac_models')
+        os.makedirs('models/sac_models', exist_ok=True)
 
         for net, name in zip(self.networks, self.networks_names):
             torch.save(
@@ -2205,10 +2204,7 @@ class SAC(RLAlgorithm):
             log_name = self._log_name
 
         # Save buffers into 'buffers/sac_buffers'
-        if not os.path.exists('buffers'):
-            os.makedirs('buffers')
-        if not os.path.exists('buffers/sac_buffers'):
-            os.makedirs('buffers/sac_buffers')
+        os.makedirs('buffers/sac_buffers', exist_ok=True)
 
         buffer_data = self.replay_buffer.get_all_transitions()
         buffer_data = as_torch_dict(buffer_data)
@@ -2221,14 +2217,17 @@ class SAC(RLAlgorithm):
         
         buffer = dict()
         seq_idx = 0
-        eval_env = self._eval_env[0]
+        # Preserve R&D's fresh post-training expert rollouts (not replay-buffer
+        # samples). Our shared held-out evaluation split is an experiment-setting
+        # adaptation: collect on training instances, outside the CL step counter.
+        rollout_env = self._sampler._envs[0].envs[0]
         observations = []
         obs_len = 0
 
         while obs_len < buffer_size:
             episode_batch = obtain_evaluation_episodes(
                 self.policy,
-                eval_env,
+                rollout_env,
                 seq_idx,
                 self._max_episode_length_eval,
                 num_eps=self._num_evaluation_episodes,
@@ -2243,10 +2242,7 @@ class SAC(RLAlgorithm):
         
         assert buffer['observation'].shape[0] == buffer_size
 
-        if not os.path.exists('rollouts'):
-            os.makedirs('rollouts')
-        if not os.path.exists('rollouts/sac_rollouts'):
-            os.makedirs('rollouts/sac_rollouts')
+        os.makedirs('rollouts/sac_rollouts', exist_ok=True)
         
         path = './rollouts/sac_rollouts/rollouts_' + log_name + '.pkl'
         with open(path, "wb") as file:

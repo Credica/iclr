@@ -2,11 +2,15 @@
 # yapf: disable
 import numpy as np
 import torch
+import json
+from pathlib import Path
 
 from garage import (EpisodeBatch, log_multitask_performance, log_performance,
                     obtain_evaluation_episodes)
 from garage.torch import global_device
 from garage.torch.algos import SAC
+from garage.torch.algos.sac import (
+    _capture_training_rng_state, _restore_training_rng_state)
 
 import wandb
 
@@ -340,53 +344,82 @@ class MTSAC(SAC):
     #     ret = torch.mm(one_hots, log_alpha.unsqueeze(0).t()).squeeze()
     #     return ret
 
-    def _evaluate_policy(self, epoch):
-        """Evaluate the performance of the policy via deterministic sampling.
+    def _evaluation_policy_for_position(self, position):
+        return self.policy, getattr(self, '_learner_role', 'online_actor')
 
-            Statistics such as (average) discounted return and success rate are
-            recorded.
+    def _evaluate_policy(self, epoch, at_boundary=None):
+        """Shared Clip/baseline protocol: current periodically, seen at exit.
 
-        Args:
-            epoch (int): The current training epoch.
-
-        Returns:
-            float: The average return across self._num_evaluation_episodes
-                episodes
-
+        Offline R&D explicitly requests a boundary evaluation after each
+        distillation stage; its updates are never reported as environment steps.
         """
-        eval_eps = []
-        for seq_idx, eval_env in enumerate(self._eval_env):
-
-            self.on_test_start(seq_idx)
-            eps = obtain_evaluation_episodes(
-                    self.policy,
-                    eval_env,
-                    seq_idx,
-                    self._max_episode_length_eval,
-                    num_eps=self._num_evaluation_episodes,
-                    deterministic=self._use_deterministic_evaluation)
-
-            eval_eps.append(eps)
-            
-            self.on_test_end(seq_idx)
-
-            if isinstance(self.env_spec, list):
-                last_return = log_performance(epoch,
-                                      eps,
-                                      discount=self._discount,
-                                      results=self.results, 
-                                      use_wandb=self._use_wandb)
-
-
-        
-        
-        if not isinstance(self.env_spec, list):
-            eval_eps = EpisodeBatch.concatenate(*eval_eps)
-            last_return = log_multitask_performance(epoch, eval_eps,
-                                                    self._discount,
-                                                    self.results,
-                                                    use_wandb=self._use_wandb)
-        return last_return
+        rng = _capture_training_rng_state()
+        try:
+            if at_boundary is None:
+                at_boundary = (self._sampler is not None and
+                    self._sampler._envs[0].cur_seq_idx != self.seq_idx)
+            positions = range(self.seq_idx + 1) if at_boundary else [self.seq_idx]
+            current_returns = None
+            for position in positions:
+                policy, role = self._evaluation_policy_for_position(position)
+                env = self._eval_env[position]
+                if hasattr(env, 'start_evaluation'):
+                    env.start_evaluation(self._num_evaluation_episodes)
+                self.on_test_start(position)
+                try:
+                    episodes = obtain_evaluation_episodes(
+                        policy, env, position, self._max_episode_length_eval,
+                        num_eps=self._num_evaluation_episodes,
+                        deterministic=self._use_deterministic_evaluation)
+                finally:
+                    self.on_test_end(position)
+                name = (self._task_names[position] if self._task_names
+                        else 'task_{}'.format(position))
+                prefix = 'test/{}/{}/'.format(position, name)
+                returns = log_performance(
+                    epoch, episodes, self._discount, self.results,
+                    prefix=prefix, use_wandb=self._use_wandb)
+                clocks = {
+                    'Global env step': int(self.global_env_step),
+                    'Task env step': int(self.global_env_step - self._task_env_start_step),
+                    'Global critic updates': int(self.global_step),
+                    'Train task position': int(self.seq_idx),
+                    'Learner role': role,
+                }
+                if hasattr(self, '_distillation_updates'):
+                    clocks['Distillation update'] = self._distillation_updates
+                for key, value in clocks.items():
+                    self.results.setdefault(prefix + key, []).append(value)
+                if self._use_wandb:
+                    wandb.log({prefix + k: v for k, v in clocks.items()})
+                if getattr(self, '_evaluation_dir', None):
+                    directory = Path(self._evaluation_dir)
+                    directory.mkdir(parents=True, exist_ok=True)
+                    with (directory / 'eval_episodes.jsonl').open('a') as stream:
+                        for index, episode in enumerate(episodes.split()):
+                            info = episode.episode_infos
+                            success = episode.env_infos.get('success',
+                                episode.env_infos.get('is_success'))
+                            row = dict(
+                                clocks, epoch=int(epoch),
+                                reason='task_exit' if at_boundary else 'interval',
+                                task=name, eval_task_position=int(position),
+                                policy_head=int(position),
+                                occurrence_id=sum(n == name for n in
+                                    self._task_names[:position + 1]) - 1
+                                    if self._task_names else 0,
+                                episode=index, length=int(episode.lengths[0]),
+                                return_value=float(np.sum(episode.rewards)),
+                                success=bool(np.any(success)) if success is not None else None)
+                            for key in ('instance_id', 'reset_seed', 'bank_role'):
+                                if key in info:
+                                    row[key] = np.asarray(info[key]).reshape(-1)[0].item()
+                            stream.write(json.dumps(row) + '\n')
+                if position == self.seq_idx:
+                    current_returns = returns
+            return current_returns
+        finally:
+            _restore_training_rng_state(rng)
 
 
     def to(self, device=None):

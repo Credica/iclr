@@ -7,9 +7,9 @@ from pathlib import Path
 import shlex
 
 try:
-    from .generate_baseline_matrix import SEQUENCES, common_recording_args
+    from .generate_baseline_matrix import SEQUENCES, common_recording_args, TASK_BANK_PROTOCOL
 except ImportError:
-    from generate_baseline_matrix import SEQUENCES, common_recording_args
+    from generate_baseline_matrix import SEQUENCES, common_recording_args, TASK_BANK_PROTOCOL
 
 
 STEPS_PER_TASK = 1500000
@@ -99,6 +99,8 @@ def main():
         schema_version=1, status='prepared_not_run',
         scope='E4 main sequences; excludes E1/E2 paired branches',
         seeds=SEEDS, steps_per_task=STEPS_PER_TASK, warmup_included=True,
+        task_bank_protocol=TASK_BANK_PROTOCOL,
+        evaluation_protocol='current_every_10k_seen_at_exit_position_keyed',
         sac_optimizer='adam', clip=dict(CLIP, lower=args.singular_clip_min,
                                        upper=args.singular_clip_max),
         total_runs=len(jobs),

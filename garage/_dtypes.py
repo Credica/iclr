@@ -783,7 +783,11 @@ class EpisodeBatch(TimeStepBatch):
                 last_observations = np.asarray(
                     [p['observations'][-1] for p in paths])
 
-        stacked_paths = concat_tensor_dict_list(paths)
+        # Episode metadata (e.g. scalar reset seeds) is stacked once per
+        # episode below, not concatenated as if it were a timestep array.
+        stacked_paths = concat_tensor_dict_list([
+            {key: value for key, value in path.items() if key != 'episode_infos'}
+            for path in paths])
         episode_infos = stack_tensor_dict_list(
             [path['episode_infos'] for path in paths])
 
