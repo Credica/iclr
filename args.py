@@ -45,8 +45,10 @@ def parse_args():
     parser.add_argument('--muon_ns_steps', type=int, default=5)
     parser.add_argument('--sac_singular_clip', type=str2bool, default=False,
                         help='普通 Adam SAC 的 critic 双边权重谱裁剪')
-    parser.add_argument('--singular_clip_min', type=float, default=.25)
-    parser.add_argument('--singular_clip_max', type=float, default=4.)
+    parser.add_argument('--singular_clip_min', type=float, default=.25,
+                        help='奇异值裁剪下界（默认 %(default)s）；c=16 时设为 0.0625')
+    parser.add_argument('--singular_clip_max', type=float, default=4.,
+                        help='奇异值裁剪上界（默认 %(default)s）；c=16 时设为 16')
     parser.add_argument('--singular_clip_interval', type=int, default=200000,
                         help='任务内周期裁剪间隔（实际环境步，包含 warm-up）')
     parser.add_argument('--singular_clip_start_task', type=int, default=1,

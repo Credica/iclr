@@ -2,6 +2,7 @@
 """Prepare Clip (ours): the five E4 streams, not the E1/E2 pair tests."""
 import argparse
 import json
+import math
 from pathlib import Path
 import shlex
 
@@ -18,8 +19,13 @@ CLIP = dict(lower=0.25, upper=4.0, interval_env_steps=200000,
             target_update='entry_hard_sync_periodic_polyak')
 
 
-def assignments(repo, artifact_root):
+def assignments(repo, artifact_root, singular_clip_min=CLIP['lower'],
+                singular_clip_max=CLIP['upper']):
     """Use the baseline stream definitions as the single code source of truth."""
+    if (not math.isfinite(singular_clip_min) or
+            not math.isfinite(singular_clip_max) or
+            not 0 < singular_clip_min <= singular_clip_max):
+        raise ValueError('Clip bounds must be finite and satisfy 0 < min <= max')
     jobs = []
     for sequence, spec in SEQUENCES.items():
         occurrences = {}
@@ -36,7 +42,8 @@ def assignments(repo, artifact_root):
                 str(repo / 'main_garage.py'),
                 '--env_type', spec['env_type'], '--rl_method', 'sac',
                 '--cl_method', 'finetuning', '--sac_singular_clip', 'True',
-                '--singular_clip_min', '0.25', '--singular_clip_max', '4',
+                '--singular_clip_min', str(singular_clip_min),
+                '--singular_clip_max', str(singular_clip_max),
                 '--singular_clip_interval', '200000',
                 '--singular_clip_start_task', '1',
                 '--task_seq_idx', *map(str, spec['task_indices']),
@@ -68,12 +75,20 @@ def assignments(repo, artifact_root):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--artifact-root', type=Path, required=True)
+    parser.add_argument('--singular_clip_min', type=float, default=CLIP['lower'],
+                        help='Lower singular-value bound (default: %(default)s)')
+    parser.add_argument('--singular_clip_max', type=float, default=CLIP['upper'],
+                        help='Upper singular-value bound (default: %(default)s)')
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[1]
     artifact_root = args.artifact_root.resolve()
     if artifact_root == repo or repo in artifact_root.parents:
         parser.error('Keep experiment artifacts outside the Git checkout')
-    jobs = assignments(repo, artifact_root)
+    try:
+        jobs = assignments(repo, artifact_root, args.singular_clip_min,
+                           args.singular_clip_max)
+    except ValueError as error:
+        parser.error(str(error))
     manifest_dir = artifact_root / 'manifests'
     manifest_dir.mkdir(parents=True, exist_ok=True)
     jobs_file = manifest_dir / 'clip_jobs.txt'
@@ -84,13 +99,15 @@ def main():
         schema_version=1, status='prepared_not_run',
         scope='E4 main sequences; excludes E1/E2 paired branches',
         seeds=SEEDS, steps_per_task=STEPS_PER_TASK, warmup_included=True,
-        sac_optimizer='adam', clip=CLIP,
+        sac_optimizer='adam', clip=dict(CLIP, lower=args.singular_clip_min,
+                                       upper=args.singular_clip_max),
         total_runs=len(jobs),
         total_task_positions=sum(job['task_count'] for job in jobs),
         total_train_env_steps=sum(job['total_train_env_steps'] for job in jobs),
         expected_clip_events=sum(job['expected_clip_events'] for job in jobs),
         jobs=jobs), indent=2) + '\n')
     print('Prepared {} Clip runs (120 task positions, 180M env steps).'.format(len(jobs)))
+    print('Clip bounds: [{}, {}]'.format(args.singular_clip_min, args.singular_clip_max))
     print('Jobs:', jobs_file)
     print('Manifest:', manifest_file)
 

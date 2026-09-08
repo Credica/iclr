@@ -221,7 +221,9 @@ heads. The manifest records every task name, index, occurrence and head.
   entry; the whole queue expects 840 events. Warm-up and DMC's different UTD
   do not shift these points.
 - Both online critics' Linear weight matrices, including the Q output weight,
-  are projected to singular values **[0.25, 4]**. Actor parameters, biases and
+  are projected to singular values **[0.25, 4]** by default; the bounds are
+  configurable using `--singular_clip_min` and `--singular_clip_max`.
+  Actor parameters, biases and
   Adam moments are preserved. This is not elementwise or gradient clipping.
 - Entry Clip hard-syncs both target critics. Periodic Clip runs after the
   collection's final critic update and uses the ordinary subsequent Polyak
@@ -244,6 +246,21 @@ bash scripts/run_clip_main.sh /data/reset-distill/clip-main 0,1 --prepare-only
 # Inspect /data/reset-distill/clip-main/manifests/clip_jobs.json first.
 bash scripts/run_clip_main.sh /data/reset-distill/clip-main 0,1 --run
 ```
+
+For the c=16 ablation (`[0.0625, 16]`), supply both bounds when preparing and
+running the queue. The generated commands and JSON manifest record these values:
+
+```bash
+bash scripts/run_clip_main.sh /data/reset-distill/clip-c16 0,1 --prepare-only \
+  --singular_clip_min 0.0625 --singular_clip_max 16
+bash scripts/run_clip_main.sh /data/reset-distill/clip-c16 0,1 --run \
+  --singular_clip_min 0.0625 --singular_clip_max 16
+```
+
+The same two flags work with `python scripts/generate_clip_matrix.py
+--artifact-root ...` and with a single `main_garage.py` training command (also
+set `--sac_singular_clip True`). Bounds must be finite and satisfy
+`0 < min <= max`. Omitting the flags keeps `[0.25, 4]`.
 
 The queue runs at most two complete sequence processes per listed GPU, starts
 the next pending run when a slot is freed, and reports failures. `--prepare-only`
