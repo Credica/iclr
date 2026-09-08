@@ -44,13 +44,14 @@ def get_algo(args, spec, n_tasks, train_envs, test_envs, train_info, env_seq):
     if singular_clip_enabled:
         incompatible = ('bellman_geometry', 'bellman_response', 'pbsr', 'dsr_v2',
                         'demand_aligned_reserve', 'q_reset', 'policy_reset', 'ReDo',
-                        'crelu', 'infer', 'wasserstein', 'bellman_spectral_stats',
+                        'crelu', 'infer', 'wasserstein',
                         'use_exploration')
         if (muon_enabled or rl_method != 'sac' or args.cl_method != 'finetuning' or
-                env_type != 'metaworld' or args.branch_checkpoint or args.first_task or
+                env_type not in ('metaworld', 'dm_control') or
+                args.branch_checkpoint or args.first_task or
                 any(getattr(args, name, False) for name in incompatible) or
                 getattr(args, 'plasticity_injection_mode', 'none') != 'none'):
-            raise ValueError('谱裁剪入口仅支持从头训练的普通 Adam MetaWorld SAC')
+            raise ValueError('谱裁剪入口仅支持从头训练、无其他干预的普通 Adam MetaWorld/DMC SAC')
     if muon_enabled:
         # 此入口只比较普通 SAC 的优化器，避免混入已有塑性方法。
         incompatible = ('bellman_geometry', 'bellman_response', 'pbsr', 'dsr_v2',

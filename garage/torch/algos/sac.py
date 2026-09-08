@@ -966,12 +966,34 @@ class SAC(RLAlgorithm):
             env.reset()
             
         for _ in trainer.step_epochs():
-            for _ in range(self._steps_per_epoch):
+            # Exact-budget runs end an epoch on actual interactions, not on
+            # collection calls: the 10k warm-up is one call, not one ordinary
+            # 500/1000-step batch. Legacy update-budget runs retain their loop.
+            epoch_env_end = (self.global_env_step + self._steps_per_epoch *
+                             trainer._train_args.batch_size
+                             if self._exact_task_budget else None)
+            collection_index = 0
+            while (self.global_env_step < epoch_env_end if self._exact_task_budget
+                   else collection_index < self._steps_per_epoch):
+                collection_index += 1
+                if self._exact_task_budget:
+                    next_task = self._sampler._envs[0].cur_seq_idx
+                    if next_task != self.seq_idx:
+                        if self._task_names and next_task >= len(self._task_names):
+                            raise RuntimeError('Exact SAC budget exceeds the task sequence')
+                        # Defer the incoming intervention until after the
+                        # outgoing task's final evaluation and diagnostics.
+                        self.task_change(self.seq_idx)
+                        self.seq_idx = next_task
                 if not (self.replay_buffer.n_transitions_stored >=
                         self._min_buffer_size):
                     batch_size = int(self._min_buffer_size)
                 else:
                     batch_size = None
+                if self._exact_task_budget:
+                    batch_size = min(
+                        batch_size or trainer._train_args.batch_size,
+                        epoch_env_end - self.global_env_step)
                 
                 if self._use_exploration and batch_size is not None:
                     if self._multi_input:
@@ -1021,12 +1043,15 @@ class SAC(RLAlgorithm):
                     self.recent_trajectory.append(path)
                 assert len(path_returns) == len(trainer.step_episode)
                 self.global_env_step += collected_env_steps
+                if self._exact_task_budget and self.global_env_step > epoch_env_end:
+                    raise RuntimeError('Sampler overshot the exact SAC evaluation budget')
                 self.episode_rewards.append(np.mean(path_returns))
 
                 
 
                 for gradient_index in range(self._gradient_steps):
-                    
+                    self._is_last_collection_update = (
+                        gradient_index == self._gradient_steps - 1)
                     policy_loss, qf1_loss, qf2_loss = self.train_once(self.seq_idx)
                     self.global_step += 1
                     task_step = self.global_env_step - self._task_env_start_step
@@ -1295,7 +1320,8 @@ class SAC(RLAlgorithm):
                                     getattr(self, '_bellman_response_enabled', False) or
                                     self._exact_task_budget) and self._task_names and
                                    next_task >= len(self._task_names))
-                if self.seq_idx != next_task and not dsr_v2_finished:
+                if (self.seq_idx != next_task and not dsr_v2_finished and
+                        not self._exact_task_budget):
                     print('Task change')
                     print('Current task number =',self.seq_idx)
                     # NOTE: Must call self.task_change before changing self.seq_idx

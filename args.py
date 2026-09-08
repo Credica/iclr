@@ -48,9 +48,9 @@ def parse_args():
     parser.add_argument('--singular_clip_min', type=float, default=.25)
     parser.add_argument('--singular_clip_max', type=float, default=4.)
     parser.add_argument('--singular_clip_interval', type=int, default=200000,
-                        help='每个任务内两次裁剪之间的 critic 更新数')
-    parser.add_argument('--singular_clip_start_task', type=int, default=0,
-                        help='开始启用 critic 谱裁剪的零基任务编号；大于 0 时在该任务入口立即裁剪')
+                        help='任务内周期裁剪间隔（实际环境步，包含 warm-up）')
+    parser.add_argument('--singular_clip_start_task', type=int, default=1,
+                        help='零基起始任务位置；该任务及所有后续任务均在入口立即裁剪，默认跳过 A')
     parser.add_argument('--spectral_actor_coef', type=float, default=1e-4,
                         help='SpectralReg actor coefficient (paper default: 1e-4)')
     parser.add_argument('--spectral_critic_coef', type=float, default=1e-4,

@@ -188,6 +188,87 @@ interactions. Its launcher first trains or reuses every required single-task
 teacher and rollout, then starts distillation only if the prerequisite queue
 finishes without failures.
 
+## Clip (ours): E4 full-sequence queue
+
+This is a separate queue from the friends' seven-baseline / 105-run queues and
+from the E1/E2 two-task tests. It uses the five streams in the paper outline and
+execution plan, with **Adam only**:
+
+| Stream | Task positions per run | Seeds | Runs | Environment steps per run |
+|---|---:|---|---:|---:|
+| F1 | 10 | 1, 2, 3 | 3 | 15M |
+| F2 | 10 | 1, 2, 3 | 3 | 15M |
+| F3 | 10 | 1, 2, 3 | 3 | 15M |
+| D-W6 | 6 | 1, 2, 3 | 3 | 9M |
+| D-C4 | 4 | 1, 2, 3 | 3 | 6M |
+
+Total: **15 runs, 120 task positions, 180M training environment steps**.
+The exact order is in [the execution plan](EXPERIMENT_PLAN_20260907.md#61-任务序列).
+The Clip generator imports the same stream definitions as the baseline
+generator; it does not use the old eight-task `hard/easy` defaults. D-W6 is
+stand → walk → run → stand → walk → run; D-C4 is balance → swingup → balance →
+swingup. Repeated tasks are separate sequence positions and get separate actor
+heads. The manifest records every task name, index, occurrence and head.
+
+### Fixed Clip protocol
+
+- Every task has exactly 1.5M training environment steps, including its 10k
+  replay warm-up. MW uses 2×256 networks; DMC uses 2×1024.
+- A receives no Clip. B and **every subsequent task**, including revisits,
+  receive an immediate entry Clip, before collecting the new warm-up data.
+- Periodic Clip uses task-local **environment steps**, at 200k, 400k, 600k,
+  800k, 1M, 1.2M and 1.4M. Thus each eligible task has eight events including
+  entry; the whole queue expects 840 events. Warm-up and DMC's different UTD
+  do not shift these points.
+- Both online critics' Linear weight matrices, including the Q output weight,
+  are projected to singular values **[0.25, 4]**. Actor parameters, biases and
+  Adam moments are preserved. This is not elementwise or gradient clipping.
+- Entry Clip hard-syncs both target critics. Periodic Clip runs after the
+  collection's final critic update and uses the ordinary subsequent Polyak
+  update, with no extra hard sync. Coincident entry/periodic events are deduplicated.
+- Every 10k steps evaluate the current task (50 episodes); at task exit evaluate
+  all seen task positions before the next entry intervention, never future heads.
+  Revisit metrics are keyed by position. DMC train/eval environments are separate.
+- W&B and the recording intervals in the table above are enabled. Clip now
+  collects Bellman probe buffers and runs the existing spectral diagnostics.
+  `singular_clip_events.jsonl` records actual global/task env clocks, critic
+  update counts, trigger, layer changes and target-update policy.
+
+### Prepare or run on your local GPUs
+
+Activate `reset-distill` and configure MuJoCo / W&B as above. For example, using
+local GPUs 0 and 1 (replace this list with the GPUs you actually want to use):
+
+```bash
+bash scripts/run_clip_main.sh /data/reset-distill/clip-main 0,1 --prepare-only
+# Inspect /data/reset-distill/clip-main/manifests/clip_jobs.json first.
+bash scripts/run_clip_main.sh /data/reset-distill/clip-main 0,1 --run
+```
+
+The queue runs at most two complete sequence processes per listed GPU, starts
+the next pending run when a slot is freed, and reports failures. `--prepare-only`
+does not train. All artifacts stay outside the Git checkout. Use a fresh output
+root for a new batch: this launcher does **not** resume partially trained runs
+or skip completed main runs on rerun. No teachers are needed for Clip.
+
+The prepared manifest is a launch plan, not evidence that training completed.
+These fixes do not retroactively relabel old update-clock Clip runs. Full
+checkpoint resumption, instance/reset-seed banks, entry evaluations and the
+complete paper data schema remain separate E0 checks; see the execution plan
+before treating a batch as final paper evidence.
+
+Validation on 2026-09-08: all 33 repository tests passed in `reset-distill` on
+CPU, including the new Clip tests. They cover 500/1000-step collection clocks
+with simulated sampling/updates over three exact 1.5M-step tasks, preserved
+actor/bias/Adam state, entry hard-sync versus periodic Polyak, the DMC 2×1024
+factory configuration, and a real 8k-step cartpole revisit smoke run with small
+networks, evaluation, Hessian and Bellman/spectral records. Queue preparation
+and dry-run also passed. This is not a full-size V100 or long-run performance test.
+
+```bash
+PYTHONPATH=.:scripts python -B -m unittest discover -s scripts -p 'test_*.py'
+```
+
 ## Current experiment code
 
 The first recorded FT batch for the six fixed transfer directions is implemented in:

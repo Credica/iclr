@@ -8,7 +8,7 @@
 |---|---|
 | 正式随机种子 | 1、2、3 |
 | 单任务训练预算 | 1,500,000 个实际训练环境交互步，包含 10,000 步 warm-up |
-| 任务内评估 | 每 50,000 环境步评估当前任务 50 episodes，另含任务入口与出口 |
+| 任务内评估 | 每 10,000 环境步评估当前任务 50 episodes，与 Hessian 记录对齐；任务入口评估仍是 E0 待补项 |
 | 任务边界评估 | 每个任务结束时评估全部已见任务，各 50 episodes；不评估未来任务 |
 | Meta-World 网络 | 2×256 ReLU SAC；actor 按任务位置分配 head，critic 共享 |
 | DMC 网络 | 2×1024 SAC；重复访问同名任务时分配新的 occurrence head |
@@ -53,7 +53,7 @@ E1 正在运行的进程使用启动时冻结的源码快照；仓库后续清�
 
 - FT：保留 actor、双 Q 和对应 Adam；清空 replay；alpha 重置；target Q 与 online Q 同步。
 - Reset：重置双 online Q、双 target Q 和 critic Adam 状态；actor 保留。
-- Clip：从第二个任务开始，在每个任务入口及任务内每 200k 环境步裁剪双 online critic 的全部 Linear 权重到奇异值区间 [0.25, 4]；保留 actor、bias 和 Adam moments；裁剪后同步 target Q。
+- Clip：从第二个任务开始，在每个任务入口及任务内每 200k 环境步裁剪双 online critic 的全部 Linear 权重到奇异值区间 [0.25, 4]；保留 actor、bias 和 Adam moments；仅入口裁剪后硬同步 target Q，任务内周期裁剪沿用普通 Polyak 更新。
 - 同一时刻的入口事件和周期事件只执行一次。
 - P&C、Spectral regularization、R&D 分别记录 active-column/knowledge-base、power-iteration 正则状态、teacher/student 的模型身份和方法专有状态。
 
@@ -164,17 +164,38 @@ Meta-World 名称在配置中统一使用 `-v2` 后缀。
 | 方法 | 正式定义 | 开跑前缺口 |
 |---|---|---|
 | FT | 普通 SAC 连续微调 | 统一主序列入口与记录协议 |
-| Reset | critic-only Q reset，并重置 critic Adam | 补齐 optimizer reset 并验证边界 |
+| Reset | critic-only Q reset，并重置 critic Adam | 已实现 optimizer reset；保留正式边界验收 |
 | EWC | 原版 EWC，不叠加 Clip | 固定 Fisher、正则参数范围和系数记录 |
 | P&C | EWC-compression 的 Progress & Compress；任务后重置 active column 与 adaptor | 正式开关已固定；异构 DMC-style observation/action spec 上的 SAC 更新 smoke 已通过 |
 | Spectral regularization | k=2；每层 $(\sigma_{\max}(W)^2-1)^2+\lVert b\rVert_2^4$；actor/双 online critic 均取 1e-4；多 head actor 只正则共享层与当前任务 mean/log-std heads，不改未激活 heads | 已有 `--cl_method spectral` 与单步 power iteration；完成 DMC 环境 smoke test，不能以 hard clip 代替 |
 | ReDo | 每 1k task-local 环境步按归一化平均绝对激活（tau=0.1）识别 dormant neurons；重置 incoming、清零 outgoing、清除对应 Adam moments，并同步双 target Q | 周期实现与单元测试已完成；正式长程前保留短程 Meta-World/DMC smoke |
 | R&D | reset-and-distill teacher/student 管线 | 双机脚本先生成/复用同 seed、1.5M 单任务 teacher model+rollout，再通过固定绝对路径启动离线 student；DMC 异构输入切片和任务 head 映射已有单元测试 |
-| Clip（ours） | 第二任务起的 critic 双侧谱裁剪 | 补 DMC、分支、环境时钟、每个后续任务入口和统一诊断 |
+| Clip（ours） | 第二任务起的 critic 双侧谱裁剪 | 主序列入口已支持 MW/DMC、环境时钟、所有后续任务入口及现有 probes；E2 同源 checkpoint 分支和完整 E0 数据契约仍待补 |
 
 所有方法在 F1、F2、F3、D-W6、D-C4 上运行 seeds 1、2、3，共 8×5×3=120 个序列配置。按任务数计的名义训练预算为 1.44B 环境交互步，其中 R&D 的 teacher 预算已包含在内；student 的离线蒸馏不伪装成额外在线学习曲线。
 
-### 6.2.1 双机 baseline 分配（2026-09-08）
+### 6.2.1 Clip 主序列配置（2026-09-08）
+
+`scripts/generate_clip_matrix.py` 与 baseline 生成器共用 §6.1 的五条序列定义，
+`scripts/run_clip_main.sh` 单独排队；不混入朋友的 105 个 baseline runs，也不复用
+E1/E2 的短序列测试入口。每条序列 seeds 1/2/3，共 **15 runs、120 个任务位置、180M
+训练环境步**。DMC 重访保留为不同位置，actor head 按位置递增，不按唯一任务名合并。
+
+固定 Adam、每任务 1.5M（含 10k warm-up）、Clip 范围 [0.25, 4]、起始位置 1。
+每个符合条件的任务在 0、200k、400k、600k、800k、1M、1.2M、1.4M 裁剪，
+共八次；15 runs 共计划 840 次。周期事件落在该次采样的最后一个 critic 更新后，
+随后正常 Polyak、诊断和评估；任务出口评估先于下一任务入口裁剪。日志打开 W&B、
+1k 标量、10k feature/weight/Hessian、100k Bellman，以及原固定谱诊断关键点。
+
+启动与 `--prepare-only` 命令见 README 的 Clip 节；GPU 列表可配置，每卡两个进程自动
+接续。此处配置完成不表示 E0 全部验收：完整恢复、实例 bank、入口评估、逐 episode
+原始记录与干预前后 Q-jump 等仍按 §3/论文 §6 补齐。旧日志保持旧协议身份，不能改标签。
+
+本次验证：33 项仓库测试通过，含 Clip 调度/预算/状态保持/重复 head 回归，以及 CPU
+小网络真实 DMC cartpole 四位置重访的 8k-step 训练、评估和谱日志 smoke。完整尺寸
+V100 长程训练未在此验证中执行；队列只做了生成和 dry-run，没有启动正式 runs。
+
+### 6.2.2 双机 baseline 分配（2026-09-08）
 
 不含 Clip（ours）的七个 baseline 共 7×5×3=105 个主序列 runs。固定生成器为
 `scripts/generate_baseline_matrix.py`，两台物理机器分别使用

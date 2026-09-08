@@ -42,13 +42,13 @@ D-W6/D-C4 是本研究固定的 DMC 持续任务顺序。H8/E8/CW20/ABC/RPP 不�
 | 图表名称 | 本稿采用的定义 | 当前代码状态 |
 |---|---|---|
 | FT | 普通 SAC 连续微调 | 已有 `--cl_method finetuning` |
-| Reset | 沿用前文讨论的 critic-only Q-reset，actor 保留。正式方案重置双 Q、target Q 和对应 critic Adam 状态 | 现有 `--q_reset True` 只恢复初始化 Q 权重并同步 target，保留 Adam；须补齐 optimizer reset，不能混称同一实现 |
+| Reset | 沿用前文讨论的 critic-only Q-reset，actor 保留。正式方案重置双 Q、target Q 和对应 critic Adam 状态 | 现有 `--q_reset True` 已重置 critic Adam 并同步 target；旧 weights-only 日志单独标注 |
 | EWC | 原版 EWC，不加 clip；当前实现正则 actor | 已有 `--cl_method ewc`；需记录 Fisher、正则范围和系数 |
 | P&C | Progress & Compress：active column 学习当前任务，再蒸馏到 knowledge base；compression 用 EWC 保护旧知识，不加 Clip | 正式配置固定 `use_pandc_bc=False, reset_column=True, reset_adaptor=True`；异构 DMC-style spec SAC 更新 smoke 已通过 |
 | Spectral regularization | ICLR 2025 的 k=2 layer spectral regularizer；actor 与双 online critic 系数均为 1e-4；多 head actor 只作用共享层与当前 mean/log-std heads，不改未激活 heads；不以 hard clip 冒充 | 已实现 `--cl_method spectral`，使用不消耗训练 RNG 的单步 power iteration；需完成统一协议 smoke test |
 | ReDo | Recycling Dormant Neurons：每 1k task-local 环境步按归一化平均绝对激活和固定 tau=0.1 回收；重采样 incoming、清零 outgoing；覆盖 actor 与双 critic | 已实现受影响 Adam moments 清理、双 target Q 同步与事件记录；固定配置，不做阈值/频率扫描 |
 | R&D | 完整 reset-and-distill，包括本任务 teacher 与部署 student | 双机 staged queue 先生成/复用相同 seed、1.5M teacher model+rollout；student 使用显式 artifact root；DMC 异构输入/head 映射已有单元测试 |
-| Clip（ours） | 第二任务起的 critic 双侧谱裁剪；具体定义见 §4.1 | 当前只支持部分 Meta-World 路径，缺 DMC/分支/统一诊断兼容 |
+| Clip（ours） | 第二任务起的 critic 双侧谱裁剪；具体定义见 §4.1 | MW/DMC 完整主序列、环境时钟、后续各入口和现有 probes 已接入；E2 分支及完整数据契约仍待补 |
 
 P&C 主实验固定使用论文的 EWC compression 路径，不使用仓库可选的 BC compression 变体。每次完成 compression 后重置 active column 及 adaptor；knowledge base、Fisher、compression optimizer 和已见任务计数都属于必须保存的方法状态。[P&C 原论文](https://proceedings.mlr.press/v80/schwarz18a.html)。
 
@@ -155,11 +155,11 @@ SingularClip 已讨论弱奇异方向上的新需求、任务周期的裁剪，�
 
 ### 4.1 Clip（ours，第二任务起）
 
-拟正式协议：A 正常 SAC；B 及以后每个任务入口、任务内每 200k 环境步，对双 online critic 全部 Linear 权重（含输出头）执行：
+正式调度协议：A 正常 SAC；B 及以后每个任务入口、任务内每 200k 环境步，对双 online critic 全部 Linear 权重（含输出头）执行：
 W=U diag(σ)Vᵀ → U diag(clamp(σ,0.25,4))Vᵀ。
 保留 actor、bias、Adam moments；入口裁剪后同步 target，任务内普通 Polyak。任务入口与周期事件重合时只投影一次。
 
-这延续上一版拟重跑的定义，不等于现有日志的全部行为。当前实现只有 B 入口额外 clip，C 以后没有入口事件；周期按 critic updates，不按环境步。新协议正式运行前需要实现并验证，不能把旧结果直接改标签。DMC 若仍采用 UTD=0.25，200k 环境步约对应 50k critic updates，但应按显式环境计数触发，不能靠近似换算替代时钟。
+2026-09-08 的主序列入口已改为该环境时钟及所有后续任务入口；每个 1.5M-step 任务（含 warm-up）在 0、200k、400k、600k、800k、1M、1.2M、1.4M 共八次裁剪，A 除外。DMC 的不同 UTD 不改变触发时刻。旧实现仅 B 入口额外 clip、周期按 critic updates，旧结果不能直接改标签。五条完整序列的独立 Clip 队列见 `scripts/run_clip_main.sh`，不是 E1/E2 双任务测试；完整论文记录契约仍须按 §7 验收。
 
 ### 4.2 Motivation：Bellman 条件下的有限预算适应
 
@@ -215,8 +215,8 @@ Fig. 3 必须覆盖全部五条流，不挑最好看的序列；获取曲线图�
 | `--num_evaluation_steps 10000` | 主 baseline 每 10k 环境步评估 | Hessian 在该采样点最后一次优化后计算，随后以同一参数状态评估 |
 | `--no_stats False` | 主 baseline 与单任务 teachers 打开 | zero ratio 每 1k；feature rank/weight change 和 Hessian rank 分别每 10k；诊断后恢复训练 RNG |
 | `--wandb True`（默认） | 本地原始文件仍为权威记录；W&B 用于在线监控与汇总 | 密钥只存机器本地，不写源码/manifest；显式 `--wandb false` 仍可离线运行，且不影响必须落盘的数据 |
-| `--bellman_probe True` | 当前 FT/Reset/EWC 可用于现成 probe/checkpoint；Clip 可用于 checkpoint/事件落盘 | Clip 的 buffer 收集和 metrics probe 被覆盖为空；R&D 训练循环未接入同一管线；不能称所有方法已经等价记录 |
-| `--bellman_probe_size 1024` | 保存输入的旧入口 | 收集每任务最早 1024 transitions，不是随机 replay reservoir；Clip 当前连这些也不收集 |
+| `--bellman_probe True` | FT/Reset/EWC/Clip 使用现有 probe/checkpoint；Clip 另存裁剪事件 | Clip 已恢复 buffer 收集和 metrics probe；仍不能将这些旧指标当作 §6.2 的完整论文数据契约 |
+| `--bellman_probe_size 1024` | 保存输入的旧入口 | 含 Clip 在内，收集每任务最早 1024 transitions，不是随机 replay reservoir |
 | `--bellman_probe_interval 100000` | 主 baseline 固定 | 单位为 task-local 环境步，另存 global/task critic updates |
 | `--bellman_probe_targets 8` | 旧指标记录参数 | 当前是确定性 sin 噪声形成的 8 组 directions，不能描述为独立 MC targets |
 | `--bellman_probe_ridge 0.001` | 固定记录 | 相对 ridge；分析必须同时保留原始尺度 |
@@ -279,17 +279,17 @@ B 入口尚未收集新任务 anchors 时，先保存干预前后模型，再在
 
 ## 7. 当前实现缺口与正式运行前检查
 
-以下为只读审计结果；本次没有修复这些代码。
+以下区分 2026-09-08 主序列修复与尚未完成的论文记录/恢复要求；局部测试不等于全部 E0 验收。
 
 | 缺口 | 代码证据与必须的处理 |
 |---|---|
-| 1.5M 预算口径未统一 | `main_garage.py:85–106` 额外加 warm-up，`args.py:64` 的 exact_sac_task_budget 是 critic 更新预算；必须新增真实 env 计数并验证包含 warm-up 的每任务恰好 1.5M |
-| Clip 不支持 DMC/分支/full probe | `garage/algo_factory.py:31–40` 明确拒绝，`sac_singular_clip.py:108–112` 关闭 probe 收集；须适配，不能只改一个 launch flag |
-| Clip 正式调度与旧实现不同 | 当前仅 B 入口额外 clip、周期按 task-local critic updates；统一为本稿环境时钟与每个后续任务入口后写测试 |
+| 1.5M 预算 | 共享 SAC 的 exact 路径已按实际 env 数结束 epoch，包含 warm-up，避免末任务多采样；独立训练循环和旧日志仍需分别审计 |
+| Clip DMC/probe/分支 | 已开放从头训练的 DMC 和现有 Bellman/spectral probe；E2 同源 checkpoint 分支仍未开放，不将主序列队列冒充 rethink 矩阵 |
+| Clip 正式调度 | 已改为 task-local env steps、B 及以后每个入口、事件去重；入口硬同步 target，周期普通 Polyak；测试在 `scripts/test_sac_singular_clip.py` |
 | Reset、P&C、谱正则、ReDo、R&D 适配 | Reset Adam reset、SAC SpectralReg、周期 ReDo 和 R&D staged teacher loader 已实现并有针对性单元测试；P&C 已完成异构 DMC-style spec 的真实 SAC 更新，R&D 已完成异构输入切片与目标 head teacher 映射测试；目标机器启动时仍保留常规短程预检 |
-| D-W 未注册 | `main_garage.py:40–42` 的 DMC 列表没有 walker；补任务定义后核对重复任务/head |
-| 评估对象与标识不合要求 | `mtsac.py:340–360` 当前遍历包括未来在内的全部任务，DMC 默认共用 Evaluation prefix；需 current/seen 调度及 task_position/occurrence_id |
-| 评估消耗训练 RNG | `stochastic_policy.py:112` 先 sample，rollout 才取 mean；增加 eval episodes 会改变随机流；需要 RNG 隔离并验证打开记录不改变训练更新 |
+| D-W 注册与完整配置 | DMC 名称已和 suite.ALL_TASKS 对齐；Clip manifest 包含 F1/F2/F3 的 10 个位置、D-W6 的 6 个位置、D-C4 的 4 个位置及 occurrence/head 信息 |
+| 评估对象与标识 | Clip 已用 current/seen 调度和位置前缀，出口评估先于下一次入口干预；其他方法的评估统一、入口评估和逐 episode schema 仍需补齐 |
+| 评估随机性 | 共享 SAC 已保存/恢复全局训练 RNG，DMC train/eval 已拆为独立环境；固定实例/reset-seed bank 和完整恢复仍待验证 |
 | 原始评估与可恢复状态缺失 | 现 pkl 只有汇总，旧 checkpoints 缺 replay/RNG/env/alpha optimizer 等；需补 §6 schema 与恢复一致性检查 |
 | 现 kernel 尺度不对应理论速度 | `bellman_spectral_stats.py:43–47` 用 JJᵀ/参数数目；正式分析同时保存未中心化 JJᵀ/n 与实际损失缩放，不能直接代入旧数值 |
 | 固定实例并不保证 50 条不同轨迹 | `task_sampler.py:534` 固定 task instance；需固定训练/评估实例列表，记录 reset/goal，检查评估多样性。主协议沿用多实例设计，不能仅把 eval 数改成 50 就声称已实现 |

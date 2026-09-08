@@ -77,6 +77,7 @@ print(env_seq)
 
 
 if args.wandb:
+    os.makedirs('logs', exist_ok=True)
     wandb.login()
     wandb.init(
         name = args.proc_name,
@@ -151,6 +152,19 @@ if args.rl_method == 'sac':
     
     batch_size = _sac_collection_batch
     num_evaluation_steps = args.num_evaluation_steps
+    if args.exact_sac_task_budget:
+        if (not 0 < train_task_count <= n_tasks or
+                num_evaluation_steps < 10000 or
+                num_evaluation_steps % batch_size or
+                _steps_per_task % num_evaluation_steps or
+                timesteps % num_evaluation_steps):
+            raise ValueError('Exact SAC requires valid task count, evaluation interval >= '
+                             '10k aligned to collection batches, and budgets divisible by it')
+        if (args.sac_singular_clip and
+                (args.singular_clip_interval < 10000 or
+                 args.singular_clip_interval % batch_size)):
+            raise ValueError('Clip interval must be >= warm-up and divisible by the '
+                             '500/1000-step collection batch')
     epoch_cycles = num_evaluation_steps // batch_size
     epochs = timesteps // (batch_size * epoch_cycles)
 

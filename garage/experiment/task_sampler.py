@@ -595,16 +595,20 @@ class CLTaskSampler(TaskSampler):
         elif self._env_type == "dm_control":
             from garage.envs.dm_control import DMControlEnv, dmc_task_name
             task_seq = [self.DM_CONTROL_ENV_SEQS[i] for i in task_seq_idx]
+            eval_updates = []
             for domain, task in task_seq:
-                env = DMControlEnv.from_suite(domain, task)
                 task_name = dmc_task_name((domain, task))
-                env = TaskNameWrapper(env, task_name = task_name)
-                if inner_wrapper is not None:
-                    env = inner_wrapper(env)
-                updates.append(env)
+                # Evaluation must not step/reset the training physics or its
+                # per-environment RNG, including repeated task occurrences.
+                for destination in (updates, eval_updates):
+                    env = DMControlEnv.from_suite(domain, task)
+                    env = TaskNameWrapper(env, task_name=task_name)
+                    if inner_wrapper is not None:
+                        env = inner_wrapper(env)
+                    destination.append(env)
             
         train_envs = [ContinualLearningEnv(updates, self._env_type, self._steps_per_env, self.seed, self._exploration_steps)]
-        if self._env_type == 'atari':
+        if self._env_type in ('atari', 'dm_control'):
             return train_envs, eval_updates
         
         return train_envs, updates

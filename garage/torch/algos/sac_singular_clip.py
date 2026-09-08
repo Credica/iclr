@@ -11,6 +11,7 @@ import os
 
 import torch
 
+from garage import log_performance, obtain_evaluation_episodes
 from garage.torch.algos.finetuning import Finetuning_SAC
 
 
@@ -48,7 +49,7 @@ class FinetuningSACSingularClip(Finetuning_SAC):
     """在真实 critic Adam 更新后、actor 更新前，周期性直接裁剪权重。"""
 
     def __init__(self, singular_clip_min=.25, singular_clip_max=4.,
-                 singular_clip_interval=200000, singular_clip_start_task=0,
+                 singular_clip_interval=200000, singular_clip_start_task=1,
                  **kwargs):
         if (not math.isfinite(singular_clip_min) or
                 not math.isfinite(singular_clip_max) or
@@ -65,24 +66,44 @@ class FinetuningSACSingularClip(Finetuning_SAC):
                                           start_task=int(singular_clip_start_task),
                                           scope='online_critics_all_linear_weights',
                                           optimizer='Adam', optimizer_state='preserve',
-                                          target_update='original_polyak',
-                                          schedule='task_local_critic_updates')
+                                          target_update='entry_hard_sync_periodic_polyak',
+                                          schedule='task_local_environment_steps')
         self._singular_clip_events = []
+        self._singular_clip_event_keys = set()
         super().__init__(**kwargs)
-        self._bellman_probe_buffers = {}
         print('SINGULAR_CLIP_CONFIG', json.dumps(self._singular_clip_config), flush=True)
 
+    def train(self, trainer):
+        # Also support an explicit start_task=0 ablation; the formal default
+        # is 1, so A receives no intervention at all.
+        self._clip_at_task_start(int(self.seq_idx))
+        return super().train(trainer)
+
     def _after_critic_update(self, samples, seq_idx):
-        # 计数器在实际 Adam 更新后递增；不依赖 TD target 或早期样本对齐。
-        step = self._critic_optimizer_steps
+        # The final update of a collection is immediately followed by the
+        # ordinary Polyak update and diagnostics/evaluation. UTD does not
+        # change this clock, and warm-up is included in the environment count.
+        step = int(self.global_env_step - self._task_env_start_step)
         config = self._singular_clip_config
         if (int(seq_idx) < config['start_task'] or step == 0 or
-                step % config['interval']):
+                step % config['interval'] or
+                not getattr(self, '_is_last_collection_update', True)):
             return
+        if self._sampler is not None:
+            next_task = self._sampler._envs[0].cur_seq_idx
+            if (next_task != seq_idx and self._task_names and
+                    next_task < len(self._task_names)):
+                # A coincident outgoing interval/incoming boundary is one
+                # entry event (after boundary evaluation), not two clips.
+                return
         self._clip_critics(int(seq_idx), int(self.global_step + 1),
-                           int(step), 'interval')
+                           int(self._critic_optimizer_steps), 'interval')
 
     def _clip_critics(self, task, global_step, critic_optimizer_step, trigger):
+        task_env_step = int(self.global_env_step - self._task_env_start_step)
+        event_key = (int(task), task_env_step)
+        if event_key in self._singular_clip_event_keys:
+            return False
         config = self._singular_clip_config
         records = {}
         for label, model in (('qf1', self._qf1), ('qf2', self._qf2)):
@@ -93,30 +114,62 @@ class FinetuningSACSingularClip(Finetuning_SAC):
                     records[label][name + '.weight'] = clip_weight_singular_values_(
                         layer.weight, config['lower'], config['upper'])
         event = dict(global_step=int(global_step), task=int(task),
+                     global_env_step=int(self.global_env_step),
+                     task_env_step=task_env_step,
                      critic_optimizer_step=int(critic_optimizer_step),
+                     target_update=('hard_sync' if trigger == 'task_start'
+                                    else 'polyak'),
                      trigger=trigger, critics=records)
+        self._singular_clip_event_keys.add(event_key)
         self._singular_clip_events.append(event)
         print('SINGULAR_CLIP', json.dumps(event), flush=True)
         if self._bellman_probe:
             path = os.path.join(self._bellman_probe_run_dir, 'singular_clip_events.jsonl')
             with open(path, 'a') as stream:
                 stream.write(json.dumps(event) + '\n')
+        return True
 
     def singular_clip_checkpoint_state(self):
         return dict(config=self._singular_clip_config, events=self._singular_clip_events)
 
-    def _append_bellman_probe(self, path, seq_idx):
-        """只复用 checkpoint 保存入口，不额外收集谱探针样本。"""
-
-    def _run_bellman_probe(self, event, task_idx):
-        """不计算额外 Bellman 目标或辅助正则。"""
-
-    def task_change(self, seq_idx):
-        super().task_change(seq_idx)
-        next_task = int(seq_idx) + 1
-        if (self._singular_clip_config['start_task'] > 0 and
-                next_task == self._singular_clip_config['start_task']):
-            self._clip_critics(next_task, int(self.global_step), 0, 'task_start')
+    def _clip_at_task_start(self, task):
+        if (task < self._singular_clip_config['start_task'] or
+                (self._task_names and task >= len(self._task_names))):
+            return
+        if self._clip_critics(task, int(self.global_step), 0, 'task_start'):
             self._target_qf1.load_state_dict(self._qf1.state_dict())
             self._target_qf2.load_state_dict(self._qf2.state_dict())
+
+    def task_change(self, seq_idx):
+        result = super().task_change(seq_idx)
+        self._clip_at_task_start(int(seq_idx) + 1)
         self.episode_rewards.clear()
+        return result
+
+    def _evaluate_policy(self, epoch):
+        """Current task periodically; all seen occurrences at task exit."""
+        at_boundary = self._sampler._envs[0].cur_seq_idx != self.seq_idx
+        positions = range(self.seq_idx + 1) if at_boundary else [self.seq_idx]
+        current_returns = None
+        for position in positions:
+            self.on_test_start(position)
+            try:
+                episodes = obtain_evaluation_episodes(
+                    self.policy, self._eval_env[position], position,
+                    self._max_episode_length_eval,
+                    num_eps=self._num_evaluation_episodes,
+                    deterministic=self._use_deterministic_evaluation)
+            finally:
+                self.on_test_end(position)
+            # Position, not a unique task name, selects the actor head. DMC
+            # revisit curves must not be merged into the first occurrence.
+            name = self._task_names[position]
+            prefix = 'test/{}/{}/'.format(position, name)
+            returns = log_performance(
+                epoch, episodes, self._discount, self.results,
+                prefix=prefix, use_wandb=self._use_wandb)
+            self.results.setdefault(prefix + 'Global env step', []).append(
+                self.global_env_step)
+            if position == self.seq_idx:
+                current_returns = returns
+        return current_returns
