@@ -44,7 +44,13 @@ def parse_args():
     parser.add_argument('--muon_momentum', type=float, default=.95)
     parser.add_argument('--muon_ns_steps', type=int, default=5)
     parser.add_argument('--sac_singular_clip', type=str2bool, default=False,
-                        help='普通 Adam SAC 的 critic 双边权重谱裁剪')
+                        help='普通 Adam SAC 的 critic 权重谱裁剪')
+    parser.add_argument('--singular_clip_mode', choices=['both', 'lower', 'upper'],
+                        default='both', help='双侧／仅下界／仅上界裁剪（默认 both）')
+    parser.add_argument('--singular_clip_schedule',
+                        choices=['entry_and_periodic', 'entry_only', 'periodic_only'],
+                        default='entry_and_periodic',
+                        help='任务入口和周期／仅入口／仅周期裁剪')
     parser.add_argument('--singular_clip_min', type=float, default=.25,
                         help='奇异值裁剪下界（默认 %(default)s）；c=16 时设为 0.0625')
     parser.add_argument('--singular_clip_max', type=float, default=4.,
@@ -52,7 +58,7 @@ def parse_args():
     parser.add_argument('--singular_clip_interval', type=int, default=200000,
                         help='任务内周期裁剪间隔（实际环境步，包含 warm-up）')
     parser.add_argument('--singular_clip_start_task', type=int, default=1,
-                        help='零基起始任务位置；该任务及所有后续任务均在入口立即裁剪，默认跳过 A')
+                        help='零基起始任务位置；从该任务起采用所选裁剪调度，默认跳过 A')
     parser.add_argument('--spectral_actor_coef', type=float, default=1e-4,
                         help='SpectralReg actor coefficient (paper default: 1e-4)')
     parser.add_argument('--spectral_critic_coef', type=float, default=1e-4,
@@ -258,6 +264,8 @@ def parse_args():
                         help='Sequence task indices using spectral advantage')
     parser.add_argument('--branch_checkpoint', type=str, default=None,
                         help='Task-A checkpoint used to start directly on task B')
+    parser.add_argument('--mechanism_record', type=str2bool, default=False,
+                        help='Opt-in snapshots and 1000-update Bellman windows for mechanism pilots')
     parser.add_argument('--branch_task_step', type=int, default=0,
                         help='Local task progress represented by a branch checkpoint')
     parser.add_argument('--branch_alpha', type=float, default=None,

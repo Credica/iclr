@@ -17,7 +17,8 @@ import torch
 from garage import EnvSpec, StepType
 from garage.replay_buffer import PathBuffer
 from garage.torch import as_torch_dict
-from garage.torch.algos.sac_singular_clip import FinetuningSACSingularClip
+from garage.torch.algos.sac_singular_clip import (
+    FinetuningSACSingularClip, clip_weight_singular_values_)
 from garage.torch.algos.bellman_spectral_stats import empirical_jacobian
 from garage.torch.policies import TanhGaussianMLPPolicy
 from garage.torch.q_functions import ContinuousMLPQFunction
@@ -61,6 +62,60 @@ class SingularClipChecks(unittest.TestCase):
         quiet = redirect_stdout(io.StringIO())
         quiet.__enter__()
         self.addCleanup(quiet.__exit__, None, None, None)
+
+    def test_one_sided_projection_changes_only_the_selected_tail(self):
+        for mode, expected, lifted, lowered in (
+                ('both', [.25, 1., 4.], 1, 1),
+                ('lower', [.25, 1., 10.], 1, 0),
+                ('upper', [.01, 1., 4.], 0, 1)):
+            with self.subTest(mode=mode):
+                weight = torch.nn.Parameter(torch.diag(torch.tensor([.01, 1., 10.], dtype=torch.float64)))
+                identity = id(weight)
+                event = clip_weight_singular_values_(weight, mode=mode)
+                self.assertEqual(id(weight), identity)
+                self.assertTrue(torch.allclose(weight, torch.diag(torch.tensor(expected, dtype=torch.float64))))
+                self.assertEqual((event['lifted'], event['lowered']), (lifted, lowered))
+                before = weight.detach().clone()
+                self.assertEqual(clip_weight_singular_values_(weight, mode=mode)['delta_norm'], 0.)
+                self.assertTrue(torch.equal(weight, before))
+        with self.assertRaises(ValueError):
+            clip_weight_singular_values_(torch.eye(2), mode='invalid')
+
+    def test_periodic_only_preserves_boundary_weights_and_normal_target_sync(self):
+        algorithm = make_algo(singular_clip_mode='upper', singular_clip_schedule='periodic_only')
+        algorithm.optimize_policy(samples(), seq_idx=0)
+        with torch.no_grad():
+            for layer in algorithm._qf1.modules():
+                if isinstance(layer, torch.nn.Linear):
+                    layer.weight.mul_(100.)
+        weights = copy.deepcopy(algorithm._qf1.state_dict())
+        moments = copy.deepcopy(algorithm._qf1_optimizer.state_dict())
+        algorithm.global_env_step = 1500000
+        algorithm.task_change(0)
+        self.assertEqual(algorithm._singular_clip_events, [])
+        for name, value in weights.items():
+            self.assertTrue(torch.equal(value, algorithm._qf1.state_dict()[name]))
+            self.assertTrue(torch.equal(value, algorithm._target_qf1.state_dict()[name]))
+        for parameter, state in moments['state'].items():
+            for key, value in state.items():
+                self.assertTrue(torch.equal(value, algorithm._qf1_optimizer.state_dict()['state'][parameter][key]))
+        algorithm.global_env_step += 200000
+        algorithm._after_critic_update(None, 1)
+        event = algorithm._singular_clip_events[0]
+        self.assertEqual(event['mode'], 'upper')
+        self.assertEqual(event['trigger_policy'], 'periodic_only')
+        self.assertEqual(event['target_update'], 'polyak')
+        for name, value in weights.items():
+            self.assertTrue(torch.equal(value, algorithm._target_qf1.state_dict()[name]))
+
+    def test_invalid_modes_schedules_and_intervals_are_rejected(self):
+        for kwargs in ({'singular_clip_mode': 'none'},
+                       {'singular_clip_schedule': 'none'},
+                       {'singular_clip_interval': 0},
+                       {'singular_clip_interval': 100.5},
+                       {'singular_clip_start_task': -1}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                make_algo(**kwargs)
 
     def test_all_later_entries_preserve_actor_bias_adam_and_sync_targets(self):
         algorithm = make_algo()
@@ -150,10 +205,17 @@ class SingularClipChecks(unittest.TestCase):
     def test_real_sac_loop_exact_1_5m_including_warmup_for_three_tasks(self):
         # Exercise the actual train loop at the full formal clock, replacing
         # environment sampling and costly gradient math only (not scheduling).
-        for collection_batch in (500, 1000):
+        for collection_batch, schedule, interval in (
+                (500, 'entry_and_periodic', 200000),
+                (1000, 'entry_and_periodic', 200000),
+                (500, 'entry_only', 200000),
+                (1000, 'periodic_only', 200000),
+                (500, 'entry_and_periodic', 100000),
+                (1000, 'entry_and_periodic', 400000)):
             environment = SimpleNamespace(cur_seq_idx=0, reset=Mock())
             algorithm = make_algo(
                 exact_task_budget=True, steps_per_epoch=10000 // collection_batch,
+                singular_clip_schedule=schedule, singular_clip_interval=interval,
                 sampler=SimpleNamespace(_envs=[environment]))
             algorithm.recent_trajectory = SimpleNamespace(append=lambda _: None,
                                                          clear=lambda: None)
@@ -192,12 +254,18 @@ class SingularClipChecks(unittest.TestCase):
             self.assertEqual(warmups, [(0, 10000), (1, 10000), (2, 10000)])
             self.assertEqual([e[0] for e in evaluations], list(range(10000, 4500001, 10000)))
             self.assertEqual(evaluations[149], (1500000, 0, 0))
-            self.assertEqual(evaluations[299], (3000000, 1, 8))
             events = algorithm._singular_clip_events
-            self.assertEqual(len(events), 16)
+            expected_count = 0
             for position in (1, 2):
+                expected_steps = [0] if schedule != 'periodic_only' else []
+                if schedule != 'entry_only':
+                    expected_steps += list(range(interval, 1500000 + int(position == 2), interval))
                 self.assertEqual([e['task_env_step'] for e in events if e['task'] == position],
-                                 [0, 200000, 400000, 600000, 800000, 1000000, 1200000, 1400000])
+                                 expected_steps)
+                expected_count += len(expected_steps)
+                if position == 1:
+                    self.assertEqual(evaluations[299], (3000000, 1, len(expected_steps)))
+            self.assertEqual(len(events), expected_count)
             self.assertEqual(algorithm.seq_idx, 2)  # no nonexistent final entry
 
     def test_evaluation_selects_current_and_seen_occurrence_heads(self):
@@ -232,6 +300,31 @@ class SingularClipChecks(unittest.TestCase):
             self.assertEqual(jacobian.shape[0], 2)
             self.assertTrue(torch.isfinite(jacobian).all())
 
+    def test_paper_dmc_pairs_resolve_specs_and_optimize_across_different_actions(self):
+        from dm_control import suite
+        from garage.envs.dm_control import DMControlEnv
+        from scripts.clip_sequences import DMC_PAPER_TASKS, SEQUENCES, paper_pair_names
+        specs = {}
+        for name, task, index in DMC_PAPER_TASKS:
+            self.assertEqual(suite.ALL_TASKS[index], task)
+            env = DMControlEnv.from_suite(*task)
+            specs[name] = env.spec
+            env.reset()
+            env.step(env.action_space.sample())
+            env.close()
+        for name in paper_pair_names('dmc'):
+            pair = SEQUENCES[name]
+            pair_specs = [specs[pair['pair_source']], specs[pair['pair_target']]]
+            algorithm = make_algo(spec=pair_specs, count=2)
+            for position, spec in enumerate(pair_specs):
+                if position:
+                    algorithm.global_env_step = 1000000
+                    algorithm.task_change(0)
+                batch = samples(obs=spec.observation_space.flat_dim, act=spec.action_space.flat_dim)
+                losses = algorithm.optimize_policy(batch, seq_idx=position)
+                self.assertTrue(all(torch.isfinite(loss) for loss in losses), name)
+            self.assertEqual([e['task'] for e in algorithm._singular_clip_events], [1])
+
     def test_full_probe_collects_and_records_for_clip(self):
         with tempfile.TemporaryDirectory() as directory:
             algorithm = make_algo(bellman_probe=True, bellman_probe_dir=directory,
@@ -260,6 +353,8 @@ class SingularClipChecks(unittest.TestCase):
             with patch('sys.argv', argv):
                 args = parse_args()
             self.assertEqual(args.singular_clip_start_task, 1)
+            self.assertEqual(args.singular_clip_mode, 'both')
+            self.assertEqual(args.singular_clip_schedule, 'entry_and_periodic')
             spec = EnvSpec(akro.Box(-np.inf, np.inf, shape=(5,)),
                            akro.Box(-1., 1., shape=(1,)), max_episode_length=1000)
             with patch('garage.algo_factory.LocalSampler', return_value=None):
@@ -270,6 +365,17 @@ class SingularClipChecks(unittest.TestCase):
             self.assertEqual(algorithm._qf1._layers[0][0].out_features, 1024)
             heads = algorithm.policy._module._shared_mean_log_std_network._output_layers
             self.assertEqual(len(heads), 8)  # mean/std pair for every position
+            with patch('sys.argv', argv + ['--singular_clip_mode', 'lower',
+                                           '--singular_clip_schedule', 'periodic_only',
+                                           '--singular_clip_interval', '400000']):
+                args = parse_args()
+            with patch('garage.algo_factory.LocalSampler', return_value=None):
+                algorithm = get_algo(args, [spec] * 4, 4, [], [], (1000, 10), ['task'] * 4)
+            config = algorithm._singular_clip_config
+            self.assertEqual(config['mode'], 'lower')
+            self.assertEqual(config['interval'], 400000)
+            self.assertFalse(config['entry_clip'])
+            self.assertTrue(config['periodic_clip'])
             args.sac_optimizer = 'muon'
             with self.assertRaises(ValueError):
                 get_algo(args, [spec] * 4, 4, [], [], (1000, 10), ['task'] * 4)

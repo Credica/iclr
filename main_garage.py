@@ -139,10 +139,14 @@ if args.rl_method == 'sac':
     train_task_count = args.train_task_count or n_tasks
     if args.branch_checkpoint:
         timesteps = _steps_per_task - args.branch_task_step
-        if args.bellman_response or args.sac_optimizer == 'muon':
+        if args.exact_sac_task_budget or args.bellman_response or args.sac_optimizer == 'muon':
             # 响应实验从 A 检查点继续执行后面所有任务，不能在 B 结束就退出。
             import torch
-            if args.sac_optimizer == 'muon':
+            if args.exact_sac_task_budget:
+                if args.branch_task_step:
+                    raise ValueError('Exact-budget branching currently supports task boundaries only')
+                from garage.torch.algos.branch_budget import remaining_branch_steps as branch_steps
+            elif args.sac_optimizer == 'muon':
                 from garage.torch.algos.sac_muon import muon_branch_steps as branch_steps
             else:
                 from garage.torch.algos.sac_bellman_response import response_branch_steps as branch_steps
@@ -167,7 +171,7 @@ if args.rl_method == 'sac':
                 timesteps % num_evaluation_steps):
             raise ValueError('Exact SAC requires valid task count, evaluation interval >= '
                              '10k aligned to collection batches, and budgets divisible by it')
-        if (args.sac_singular_clip and
+        if (args.sac_singular_clip and args.singular_clip_schedule != 'entry_only' and
                 (args.singular_clip_interval < 10000 or
                  args.singular_clip_interval % batch_size)):
             raise ValueError('Clip interval must be >= warm-up and divisible by the '
@@ -201,6 +205,9 @@ algo = get_algo(
 
 algo.to()
 algo._evaluation_dir = record_dir
+if args.mechanism_record:
+    from garage.torch.algos.mechanism_recorder import MechanismRecorder
+    algo._mechanism_recorder = MechanismRecorder(algo, record_dir / 'mechanism', args)
 if args.save_single_task_artifacts:
     algo._learner_role = 'rnd_teacher'
 trainer.setup(algo=algo, env=train_envs)

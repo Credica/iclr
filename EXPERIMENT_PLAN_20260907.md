@@ -1,149 +1,137 @@
 # 实验执行清单：Bellman Demand and Learning Spectra
 
-本文档只记录需要实现、验证和运行的实验，是仓库中的唯一执行清单。论文结构、理论主张和图表叙事以 `PAPER_OUTLINE_20260907.md` 为准；理论推导以 `MOTIVATION_METHOD_THEORY_20260907.md` 为准。本文档中的预算和表格均为计划，不是已经获得的实验结果。
+2026-09-10 修订。论文主线见 [大纲](PAPER_OUTLINE_20260907.md)，逐节内容/理论/分析见 [写作框架](PAPER_WRITING_FRAMEWORK_20260910.md)。本清单取消旧 6×6 配额，保留主实验全部设置；本次新增独立启动器 scripts/launch_mechanism_pilot.py；结果与完成状态不得由计划文字推断。
 
-## 1. 固定实验口径
+## 1. 固定实验口径：必须区分四类协议
 
-| 项目 | 固定决定 |
-|---|---|
-| 正式随机种子 | 1、2、3 |
-| 单任务训练预算 | 1,500,000 个实际训练环境交互步，包含 10,000 步 warm-up |
-| 任务内评估 | 每 10,000 环境步评估当前任务 50 episodes，与 Hessian 记录对齐；任务入口评估仍是 E0 待补项 |
-| 任务边界评估 | 每个任务结束时评估全部已见任务，各 50 episodes；不评估未来任务 |
-| Meta-World 网络 | 2×256 ReLU SAC；actor 按任务位置分配 head，critic 共享 |
-| DMC 网络 | 2×1024 SAC；重复访问同名任务时分配新的 occurrence head |
-| 统计单位 | seed；报告 3 seeds 的均值、样本标准差、全部 seed 曲线和配对差 |
-| 训练数据与评估数据 | Meta-World 每个 task/seed 固定 50 个训练实例和独立的 50 个评估实例；DMC 固定 50 个评估 reset seeds |
-| 结果边界 | episodes、tasks、checkpoints 和 transfer directions 都不能作为额外独立 seeds |
+| 实验组 | 每任务预算 | 评估 | seeds / 方法 |
+|---|---|---|---|
+| E4 主序列 MAIN | 1.5M 实际环境步，含10k warm-up | 10k 环境步、50 episodes | 1/2/3；八方法；Clip=[0.25,4] |
+| E2 N1/N2 新 MW 候选 | 1M 实际环境步，含10k warm-up | 50k 环境步、50 episodes、含出口 | FT seeds1/2/3已运行或排队；新四组Q-reset/Clip/fresh未排队 |
+| E2 N3/N4 新 DMC 候选 | 1M 实际环境步，含10k warm-up | 同上 | 同上；DMC固定α=.01、UTD=.25 |
+| E-ABC seed1两条旧parent续跑 | 新B/C各1M实际环境步，含10k warm-up；旧A仍按原update时钟 | 新50k环境步、50 episodes、含出口 | seed1共同parent；Q-reset与Clip=[0.25,8] |
+| E-ABC seeds2/3追加 | FT的A/B/C各1M环境步；Q-reset共享同seed A，仅训练B/C各1M | 同新50k/50episodes | 两个FT、两个Q-reset；无新增Clip |
+| E1 P1–P6 旧探索 | 原1.5M实际env/task，现提前停止 | 原50k环境步、50 episodes | 原18个FT；不补齐、不重启 |
 
-所有方法必须共享同一任务顺序、预算、实例 bank、评估协议和 head 语义。训练、评估、离线分析和方法专有计算分别记账，不声称不同方法的计算成本相同。
+所有方法使用 SAC/Adam，不使用 PPO/Muon。N1/N2 的网络、lr、batch 为2×256、3e-4、64、UTD1、自动α；N3/N4为2×1024、1e-4、1024、UTD.25、固定α=.01。共同γ=.99、Polyak=.005、replay容量1M。新机制任务参考R&D；MW统一缩短为1M、FT已扩展至三seeds，独立task bank与评估方案是本项目改编，不声称严格复现。
 
-## 2. 执行顺序与硬门槛
+**论文/代码差异：** R&D Table3写DMCα=.2，官方HEAD 0fa3158f6f0f41631a57e27b6c3243cffe74f957 的factory写.01。E2按用户最新要求选择代码.01，E4也保持现有.01，不做α扫描。原文MW3M/DMC1M是名义环境预算；本项目将warm-up包含在精确环境计数中。[论文](https://arxiv.org/html/2403.05066v3#A13.SS1)，[代码](https://github.com/hongjoon0805/Reset-Distill/blob/0fa3158f6f0f41631a57e27b6c3243cffe74f957/garage/algo_factory.py)。
 
-实验按 E0→E5 执行。某一阶段的正确性门槛未通过时，不启动后续大规模训练。
+统计单位为seed，报告均值、样本SD、每seed曲线与配对差；不把episode、方向、critic或更新窗口当独立seed。DMC只使用return，不填虚假success。相同实验组内使用一致task bank、网络/head布局和评估协议，不跨协议直接拼接AUC。
 
-| 阶段 | 内容 | 在线训练规模 | 当前状态 | 进入下一阶段的条件 |
-|---|---|---:|---|---|
-| E0 | 统一训练、评估、记录和恢复管线 | 仅 smoke runs | FT 记录版已完成首轮验证；其他方法待接入 | 时钟、RNG、边界事件、恢复和数据 schema 全部通过测试 |
-| E1 | P1–P6 的 FT 首批运行 | 18 个双任务 runs | 2026-09-07 已启动 | 18 个 runs 完整结束，字段审计无缺失，结果只用于质检和后续同源分支 |
-| E2 | 完整 6×6 rethink 矩阵：FT、Reset、Clip | 18 个源预训练 + 324 个目标分支 | 待实现/运行 | 三方法同源、共同 warm-up、边界行为和完整矩阵核验通过 |
-| E3 | 64 状态 MRP 与真实 critic 离线机制实验 | 不增加正式在线 RL runs | 待实现 | 理论量、共同 correction、共同 target 和实际更新误差可重算 |
-| E4 | 五条主序列 × 八方法 | 120 个序列配置 | 待实现/运行 | 八方法均满足相同协议，DMC 与重复任务路径通过 smoke tests |
-| E5 | 汇总、配对统计和图表数据审计 | 不增加正式在线 RL runs | 待实现 | Tables 1–3 与 Figs. 1–4 的每个数均可追溯到 run、seed、checkpoint 和角色 |
+## 2. 执行状态与顺序
 
-E1 正在运行的进程使用启动时冻结的源码快照；仓库后续清理不会改变这些进程的代码。E1 只提供 FT 证据，不能提前支持 Reset 或 Clip 的因果结论。
-
-## 3. E0：正式运行前的实现与正确性检查
-
-### 3.1 统一环境时钟
-
-- 每个任务恰好记录 1,500,000 个训练环境交互步，warm-up 包含在内。
-- `global_env_step`、`task_env_step`、`global_critic_updates` 和 `task_critic_updates` 分开记录。
-- 评估交互、离线数据收集和蒸馏更新不计入训练环境步。
-- Clip 的周期事件按显式环境步触发，不用 critic-update 近似代替。
-
-### 3.2 评估与随机性隔离
-
-- Meta-World 的训练实例、评估实例、reset seeds 和 goal 信息落盘并哈希。
-- 评估动作直接使用确定性均值，不先采样再取均值。
-- 评估使用独立环境和 RNG；评估前后 Python、NumPy、Torch 和 CUDA 训练 RNG 完全一致。
-- 当前任务评估和已见任务边界评估都携带 task position、occurrence ID、policy head 和 learner role。
-
-### 3.3 方法边界行为
-
-- FT：保留 actor、双 Q 和对应 Adam；清空 replay；alpha 重置；target Q 与 online Q 同步。
-- Reset：重置双 online Q、双 target Q 和 critic Adam 状态；actor 保留。
-- Clip：从第二个任务开始，在每个任务入口及任务内每 200k 环境步裁剪双 online critic 的全部 Linear 权重到奇异值区间 [0.25, 4]；保留 actor、bias 和 Adam moments；仅入口裁剪后硬同步 target Q，任务内周期裁剪沿用普通 Polyak 更新。
-- 同一时刻的入口事件和周期事件只执行一次。
-- P&C、Spectral regularization、R&D 分别记录 active-column/knowledge-base、power-iteration 正则状态、teacher/student 的模型身份和方法专有状态。
-
-### 3.4 Checkpoint 与恢复
-
-- 任务入口和出口保存完整可恢复 checkpoint，包括模型、全部 optimizers、alpha、RNG、sampler/env、replay 和方法专有状态。
-- 任务内 0、10k、50k、100k、500k、1M、1.5M 保存轻量分析快照；0 点区分干预前后。
-- 从完整 checkpoint 恢复后，下一次环境转移、采样顺序、优化更新和记录时钟必须与不中断运行一致。
-- carried-Adam 离线拟合所需的 moments、step、lr、参数映射和完整 optimizer 配置必须可用。
-
-### 3.5 必过 smoke checks
-
-- 五条主序列与 6×6 任务池名称、顺序、重复位置和 head 分配正确。
-- 同 seed 的同源分支具有相同 A checkpoint、B warm-up transitions、实例 bank 和初始化 hash。
-- 打开记录功能不改变相同 minibatch 下的 loss、参数更新和训练 RNG。
-- Reset 和 Clip 的 before/after 权重、Q 输出、target 同步和 optimizer 处理与定义一致。
-- DMC walker 任务注册、DMC 接口、重复访问任务和所有八种方法均能完成短程运行。
-- 所有 JSONL 可逐行解析；缺失值使用 null/不适用，不用 0 冒充。
-
-## 4. E1–E2：Rethink 迁移矩阵
-
-### 4.1 固定任务池
-
-| ID | 源任务 A | 目标任务 B |
+| 阶段 | 内容 | 当前状态 |
 |---|---|---|
-| P1 | sweep-into-v2 | push-wall-v2 |
-| P2 | push-wall-v2 | sweep-into-v2 |
-| P3 | button-press-v2 | button-press-wall-v2 |
-| P4 | button-press-wall-v2 | button-press-v2 |
-| P5 | reach-v2 | window-close-v2 |
-| P6 | window-close-v2 | reach-v2 |
+| E0 | 新机制/ABC恢复、时钟、边界和记录正确性 | 原13项回归和六条真实短测通过；本次追加队列/分支9项检查通过；不代表长程效果 |
+| E1（历史） | P1–P6 18个FT | 用户要求停止；18 workers、5 supervisors已退出，数据保留 |
+| E2 pilot | 四方向N1–N4各FT seeds1/2/3 | 共12条运行/队列；新四组Q-reset/Clip/fresh未排队 |
+| E3 | MRP与离线谱/动态/干预分析 | 部分历史分析已完成，新组待数据 |
+| E-ABC | seed1旧A的Q-reset/Clip-8；seeds2/3新FT及同seed A分出的Q-reset | 共6条运行/依赖队列；新Q-reset须等对应A文件完成验证 |
+| E4 | 五条主序列×八方法×三seeds | 按既有队列继续；本次不改参数、不停主实验 |
+| E5 | 图表/统计/证据审计 | 随结果推进，不预填结论 |
 
-完整任务池为 `sweep-into-v2`、`push-wall-v2`、`window-close-v2`、`button-press-v2`、`button-press-wall-v2`、`reach-v2`。E2 运行全部 36 个 A→B 方向，包括 30 个跨任务格和 6 个自迁移格。
+E1的原status记录为failed/KeyboardInterrupt，是人工取消而非数值失败。说明在本地批次 STOPPED_BY_USER_20260910.md；保留原始status，不把停机记录改成completed。已完成的54窗口离线分析只使用其冻结至B=500k的在线对照，不自动把更晚未审计记录混入。
 
-### 4.2 在线运行构成
+本次E0短测后先执行四条FT seed1与ABC两条，共6条运行/12M新环境步。四组FT各在GPU0/1/2/3，ABC两条在GPU7；不停止GPU7已有他人进程。fresh与新四组Q-reset/Clip不在本次队列。后续完整对照可复用兼容A parent。四个方向与全部seeds事先固定；基础对照用于判断现象和诊断配置，不依据Clip排名暗中筛组。文献不保证每个方向每个seed负迁移，若不出现则报告该结果，不无上限调参到失败。
 
-- 每个源任务独立预训练 seeds 1/2/3，共 18 个 A runs。
-- 每个 A checkpoint 分支到 6 个 B，每个 B 运行 FT、Reset、Clip，共 36×3×3=324 个 B runs。
-- 三个方法分支共享完整 A checkpoint 和共同 B warm-up transitions。
-- A 阶段不执行 reset 或 clip，源预训练在方法间复用。
-- Fresh 参照复用六个源任务从初始化学习 1.5M 的曲线；它不是第四个在线方法。
-- E2 的计划训练预算为 513M 环境交互步；P1–P6 已包含在矩阵中，不重复训练。
+## 3. E0：新增入口必须通过的检查
 
-### 4.3 Fig. 1 与迁移指标
+追加批次：scripts/extend_mechanism_seeds.py登记12条（四组FT×seeds2/3共8，ABC FT/Q-reset×seeds2/3共4），新增26M环境步，与首批合计18条/38M。原每卡两个槽位的排队规则已按用户最新要求取消：所有非reset立即启动，GPU0/1各4条、GPU2/3各3条、GPU7保留2条，共16条训练；ABC FT先训练各自A，A的模型/optimizer/1M-env/三head和hash验证后才释放同seed Q-reset依赖，不复用seed1父模型。失败不自动重试；缺父模型只阻断对应Q-reset。实际状态见 /home/zqy/plasticity-papers/mechanism_seed23_20260910_v1/actual_status.json；旧queue_state仅为依赖协调器的逻辑状态，提前启动的FT由重复启动保护接管，不会重训或覆盖。
 
-完整矩阵分别报告：
+### 3.1 时钟、环境与评估
 
-- FT − fresh：识别来源依赖的正/负迁移；
-- Reset − FT：识别 critic 重置对迁移的改变；
-- Clip − FT：识别谱调理对迁移的改变。
+- E2与E-ABC的新任务均为1M精确环境预算，包含10k warm-up；旧ABC的A parent仍保留历史1M更新标签。明确区分global/task env与critic updates。
+- Clip间隔200k按任务内实际环境步，从入口0计数；与UTD无关。不能用10k warm-up后的200k更新替代。
+- MW每task/seed固定50训练实例和独立50评估实例，episode horizon500；DMC固定50评估reset seeds、horizon1000。
+- 评估确定性均值动作，独立环境；保存恢复Python/NumPy/Torch/CUDA RNG。出口评估已见任务，不评未来head。
+- 新机制A出口之前保存完整source；B共同warm-up由同一固定行为策略/独立RNG产生，不因reset耗用RNG而变化。B anchors在warm-up结束才可获得，不冒充step0已知诊断。
+- DMC使用suite元组解析任务，验收异构输入切片、输出动作/head、padding和fresh相同布局；不硬编码不同依赖版本的数字ID。
+- E2固定α=.01进入manifest，与factory及E4一致。
 
-每个矩阵格先在相同 direction、seed 和数据协议下形成配对差，再跨三个 seeds 汇总。不能把 36 个方向当作 36 个训练 seeds。
+### 3.2 同源分支与边界
 
-## 5. E3：理论与真实 critic 机制实验
+- FT保留actor、双Q、各自Adam；MW边界α重置1，DMC固定α保持；清replay并同步target。
+- Q-reset保留actor/actor Adam，重置双online Q与critic Adam，硬同步target；不是完整fresh。
+- Clip保留actor、bias和Adam，对双Q全部Linear权重裁剪；入口硬同步target，周期普通Polyak；同一入口/周期重合去重。
+- E2为[0.25,4]；E-ABC Clip-8为[0.25,8]，不得全局改默认值。
+- 独立记录reset初始化RNG、父checkpoint hash、分支配置、初始Q与前后事件；三seeds不是从同一个seed1 parent变更标签得到的。
+- 每个分支必须保存自己B结束模型；ABC的C从各自B继续，不换回旧FT的B。
 
-### 5.1 64 状态环形 MRP
+### 3.3 本次实现与仍然存在的限制
 
-- 运行 $\gamma\in\{0,0.9,0.99\}$，随机构造使用 seeds 1、2、3。
-- 固定学习核 $K$ 的特征值集合，改变需求方向与 Bellman 传播模态。
-- 分别构造匹配即时 TD 幅度和匹配完整价值修正幅度的条件。
-- 直接计算理论有限步误差、慢模态质量和预算界，并与数值迭代逐项对齐。
-- 同时给出有利与不利于 Clip 的条件，不能只保留支持方法的构造。
+1. factory已允许exact-budget任务边界Clip分支；仍拒绝不受支持的任务内恢复和混合干预。
+2. main_garage.py的exact-budget分支现按剩余全部任务计数，ABC为B+C=2M新环境步。
+3. fresh online critic不再加载旧critic Adam，actor Adam继续继承；测试覆盖两种分支状态。
+4. ABC启动器显式branch_alpha=1，C入口沿普通边界规则再次重置温度。
+5. 新启动器冻结main/factory与记录器；不改写锁定P1–P6/MW的旧rethink_ft_recorded.py，不影响旧进程或朋友队列。
+6. 原checkpoint缺完整RNG/env/replay的情况必须标明；分析快照不等于可逐位恢复状态。
 
-该实验是精确矩阵计算，不使用每任务 1.5M 的 RL 预算。输出对应 Fig. 2a–b 和理论附录。
+13项单元/回归测试已通过，含精确时钟、分支优化器、Clip及记录不改变更新/RNG。六条真实10k/task短测与1M/task正式运行分目录，状态以各run的status.json为准；短测不是论文结果。
 
-### 5.2 同 correction 离线拟合
+### 3.4 安全与资源
 
-- 对 P1–P6 的 parent、FT、Reset、Clip 副本使用相同输入、相同初始 correction、更新预算和批次顺序。
-- 保存并报告 $H\in\{0,1,10,50,200,1000\}$ 的绝对 MSE 与归一化误差。
-- 先用统一 full-batch GD 校准理论，再运行 fresh Adam 与 carried Adam 条件。
-- 保存未中心化 $K=JJ^\top/n$、特征值/特征向量、实际损失缩放和模型/输入哈希。
+输出使用新artifact root，禁止覆盖H-ABC/E1/朋友主实验目录。不删除旧缓存或日志。诊断不改变训练RNG；先测窗口文件规模和吞吐，尤其DMC1024网络，记录资源预算。保留原始数据在Git忽略目录；不提交checkpoint、日志、replay或结果。
 
-### 5.3 同真实 target 与动态 target 流
+## 4. E2：四个固定方向
 
-- P1–P6 在 B=10k、100k、500k、1M 窗口复用 FT 参考轨迹。
-- 每个窗口保存 1000 次更新的共同 targets、固定 next-action 随机量、target Q、actor、alpha 来源和时间戳。
-- 共同 target 流与每个分支自己生成的在线 target 流分别保存、分别命名。
-- 计算 $J\Delta\theta$、实际 $\Delta Q$、target drift、optimizer/采样偏差和非线性余项；不能把所有误差统称为非线性。
+| ID | 源A | 目标B | 证据 |
+|---|---|---|---|
+| N1 | sweep-into-v2 | push-wall-v2 | 原论文明确案例＋本地ABC受阻线索 |
+| N2 | window-open-v2 | sweep-into-v2 | 原Hard相邻顺序＋Window→Sweep组级负迁移；固定pair仍待本地验证 |
+| N3 | ball_in_cup-catch | finger-turn_easy | 原Fig.14(a)的具体SAC任务对负均值 |
+| N4 | cartpole-swingup | fish-upright | 原Fig.14(a)的具体SAC任务对负均值 |
 
-### 5.4 干预到后续表现的配对链
+来源与限制详见大纲§3。仅四方向，不扩展交叉组合，不承诺“一定负迁移”。N3的suite元组为(ball_in_cup,catch)→(finger,turn_easy)；N4为(cartpole,swingup)→(fish,upright)。本地构造检查通过，观测/动作维数分别8/2→12/2、5/1→21/5；这不等于SAC训练通过。
 
-对 P1–P6 的每个 direction/seed，将 B 入口的干预前后状态与同一分支的后续 B 曲线配对，汇总：
+### 4.1 作业数与fresh
 
-- 即时 Q-jump RMS 与 max jump；
-- 谱与 kernel 的变化；
-- 同 correction 的 200 步归一化拟合误差；
-- 同真实 target 的 200 步 MSE；
-- B success-AUC 与最终 success。
+当前四方向×三seeds×FT(A→B)=24M环境步，含队列。后续完整证据计划为每方向×3seeds：1个A预训练、FT/Q-reset/Clip三个B分支、1个fresh-B，共60个单任务、60M环境步（包含兼容的已跑部分），不是本次待执行队列。
 
-这些结果进入 Table 3 和 Fig. 4。相关性只在已测试条件内解释，不声称排除了全部探索、范数或 optimizer 替代解释。
+Fresh从头训练完整actor/critic，使用和该方向B一致的网络/head/输入布局、任务bank、预算、评估规则。不能将主序列teacher、不同head的A训练或旧1.5M曲线直接当成fresh。符合全部条件的缓存才能去重，并保留核验记录；名义预算不预先扣除未知缓存。
+
+### 4.2 指标与判定
+
+- 主获取差：ΔAUC=(1/T_B)∫(FT−fresh)dt；MW用success，DMC用return，各自单位。
+- 终段差：最后五个实际评估点的FT−fresh，另报最后一点。
+- 方法差：Q-reset−FT、Clip−FT，同direction/seed/parent先配对再汇总。
+- 三seed方向不一致标混合；fresh/FT都低不自动解释为历史导致失学。
+- N1–N4全部保留，不用新结果事后替换方向或种子。旧P1–P6作为探索批次保留，不估计无偏普遍发生率。
+
+### 4.3 ABC两条补充续跑
+
+共同parent及hash见大纲§4：旧H-ABC的task_boundary_task0_step1000000.pt。只新增Q-reset与Clip-[0.25,8]，seed1，均继续push-wall→window-close，新任务各1M实际环境步（含warm-up）；B/C入口按定义干预，Clip每200k环境步。
+
+parent含模型和actor/critic Adam，但无完整RNG/env/replay/alpha optimizer；新的共同启动协议需落盘。旧FT为100k更新/20episodes的历史参照；新两条为50k环境步/50episodes，不当作完美三臂因果对照。未授权自动加seed1 FT-continuation；如需严格重启对照另行安排。本次启动，实际进度见新run状态文件。
+
+## 5. E3：理论、谱与动态分析
+
+ABC seeds2/3追加：每个FT从头训练A→B→C，共3M；同seed Q-reset等待A=1M环境步的出口checkpoint完成后，从B→C续跑，共2M，两个seed合计10M。父文件/hash另存parents，FT不必等待Q-reset。新seed A为1M环境步，与旧seed1 A=1M更新不同；reset分支重新设RNG，不宣称与FT共享逐步随机轨迹。
+
+### 5.1 精确MRP
+
+64状态对称环形MRP，γ=0/.9/.99，构造seeds1/2/3。固定K全谱改变需求；固定需求改变弱方向速率；分别匹配即时残差与完整修正幅度。检验矩阵迭代、谱公式、预算下界及干预净收益恒等式。保持合法P与明确稳定区间；非交换情形不套共同基公式。包含有利和不利干预构造，不属于在线RL配额。
+
+### 5.2 同输入、同需求谱分析
+
+- 两个不同episode的128点panel，共256个B anchors；固定索引/hash，另保留后期reservoir检查分布敏感性。
+- 初始/A历史/A出口/B阶段/fresh/干预后模型：未中心化full-J K=JJᵀ/n；同时记录原始尺度与归一化谱。
+- D_emp保留多个残差列；中心化D、target increments分别标记。95%子空间只描述结构，负担和响应不丢尾部。
+- 固定D换K、固定K换D；报告方向能量、逆谱负担、有限步响应及same-correction拟合。
+- 主relative ridge1e-3，1e-4/1e-2敏感性；原始尺度与shape结论不偷换成真实Adam速度。
+- 未来需求只用于回溯，不标为入口可得预测；相邻更新不是独立seed。
+
+### 5.3 动态记录与滞后
+
+当前计划：四组FT三seeds各在B=10k/100k/500k记录，共36窗口；ABC六条运行各在B/C相同时点记录，共36窗口，合计72个1000-update窗口。每个窗口存1001组双critic参数、逐步真实minibatch/target及固定128-input目标/输出路径，端点存Adam/RNG；全局初始化及关键点另存快照。固定输入来自warm-up transitions，不声称episode独立。四方向FT36窗口已纳入队列；该四方向Q-reset/Clip入口24窗口仍未排队。
+
+前100次更新构造需求，第100次更新固定核方向，分析后900次实际修正、方向残差、target流入与非线性余项。DMC1000updates约覆盖4000环境步。逐步参数采用起点＋必要差分/重建数据，不反复保存完整actor/target；记录开销先做smoke估算。
+
+### 5.4 同源干预到在线获取
+
+对每direction/seed对齐Q-jump、target反馈、同D几何、同correction/同真实target的200/1000update拟合、入口真实方向修正与后续B获取。共同外部target重放与各自闭环target分开报告。Adam/采样差异是代数参照，不称失败的因果百分比。
+
+与论文Fig.3/4和Table3对应；P1–P6已有不利Clip重放保留。新的配对证据没有出现之前，不称已证明Clip解除瓶颈。
 
 ## 6. E4：五条主序列
 
@@ -189,7 +177,7 @@ E1/E2 的短序列测试入口。每条序列 seeds 1/2/3，共 **15 runs、120 
 
 启动与 `--prepare-only` 命令见 README 的 Clip 节；GPU 列表可配置，每卡两个进程自动
 接续。此处配置完成不表示 E0 全部验收：完整恢复、入口评估、完整逐 episode
-原始记录与干预前后 Q-jump 等仍按 §3/论文 §6 补齐。旧日志保持旧协议身份，不能改标签。
+原始记录与干预前后 Q-jump 等仍按 §3/写作框架 §9 补齐。旧日志保持旧协议身份，不能改标签。
 
 本次验证：33 项仓库测试通过，含 Clip 调度/预算/状态保持/重复 head 回归，以及 CPU
 小网络真实 DMC cartpole 四位置重访的 8k-step 训练、评估和谱日志 smoke。完整尺寸
@@ -201,7 +189,7 @@ V100 长程训练未在此验证中执行；队列只做了生成和 dry-run，�
 `scripts/generate_baseline_matrix.py`，两台物理机器分别使用
 `scripts/run_baselines_machine_1.sh` 与 `scripts/run_baselines_machine_2.sh`；每台机器使用本地 GPU 0–7，每卡最多两个进程，空闲 slot 自动从本机队列补位。机器 1 分配 53 个 runs（440 个任务位置），机器 2 分配 52 个 runs（400 个任务位置）。R&D 的 F1/F2/F3 × seeds 1/2/3 全在机器 1，D-W6/D-C4 × seeds 1/2/3 全在机器 2；分别需要 48 个 Meta-World、15 个 DMC teacher/task/seed 前置项，本机内部去重、跨机无重复 teacher。非 R&D 按全局 run ID 交替分配，但 FT/F1/seed 1 放在机器 2，得到 44/46 个非 R&D runs。每次生成保存逐 run JSON manifest，包括完整任务、seed、命令、机器、阶段和依赖；这个分配不保证两台墙钟耗时相同。
 
-所有在线 SAC/teacher 命令显式使用 `--wandb True` 与 50 evaluation episodes。loss、reward、alpha、speed、zero ratio 每 1k 环境步；feature rank、weight change 每 10k；Hessian rank 每 10k 且在同一模型状态后进行 10k evaluation；Bellman probe 每 100k。`--no_stats False` 打开这些统计；诊断和评估前后恢复 Python/NumPy/Torch/CUDA RNG。full-Jacobian Bellman spectral stats 固定在 10k、50k、100k、500k、1M、1.5M，不改成等间隔扫描。probe/checkpoint 与所有生成结果写入仓库外的 run 独立目录。
+本节主序列队列的所有在线 SAC/teacher 命令显式使用 `--wandb True` 与 50 evaluation episodes。loss、reward、alpha、speed、zero ratio 每 1k 环境步；feature rank、weight change 每 10k；Hessian rank 每 10k 且在同一模型状态后进行 10k evaluation；Bellman probe 每 100k。`--no_stats False` 打开这些统计；诊断和评估前后恢复 Python/NumPy/Torch/CUDA RNG。full-Jacobian Bellman spectral stats 固定在 10k、50k、100k、500k、1M、1.5M，不改成等间隔扫描。probe/checkpoint 与所有生成结果写入仓库外的 run 独立目录。
 
 两个 bash 的 `--run` 自动执行两个阶段，无需第二次手动启动：第一阶段运行 `baseline_non_rnd_machine_N.txt`，机器 1 为 44 runs，机器 2 为 46 runs，共 90 runs；按 FT → Reset → EWC → P&C → Spectral regularization → ReDo 派发，方法之间可以重叠，每个空闲 slot 接续下一个完整序列 run。
 
@@ -219,7 +207,7 @@ R&D 保留原方法的独立单任务专家训练、训练结束后新采集专�
 
 ### 6.2.3 Baseline 与 Clip 共用评估实现（2026-09-08 修订）
 
-所有在线 baseline 与 Clip 统一调用 `MTSAC._evaluate_policy`，遵循 §1：任务内仅评估当前位置，任务出口评估全部已见位置，绝不评估未来 head。P&C 对旧任务使用 KB、当前任务使用 active column；R&D 在每个离线 student 阶段完成后评估已见位置，环境时钟不因蒸馏增长。DMC 不再把各任务挤进同一个 `Evaluation` key。
+所有在线 baseline 与 Clip 统一调用 `MTSAC._evaluate_policy`，遵循 §1 的主序列口径：每 10k 环境步仅评估当前位置，任务出口评估全部已见位置，绝不评估未来 head；此处不是 E1/E2 的 50k 入口。P&C 对旧任务使用 KB、当前任务使用 active column；R&D 在每个离线 student 阶段完成后评估已见位置，环境时钟不因蒸馏增长。DMC 不再把各任务挤进同一个 `Evaluation` key。
 
 正式 exact-budget SAC 自动使用 `fixed-task-banks-v1`。MW 按 task name/seed 分别生成 50 个训练实例与 50 个无交集评估实例，训练采用私有 RNG 均匀抽样；评估每轮从固定实例 0–49 开始。DMC 训练/评估环境隔离，每轮重复固定 50 个 evaluation reset seeds。bank 不依赖 method/stream/occurrence，单任务 teacher 与序列模型共享相同划分。`task_banks/` 保存 pickle、reset seeds 与 SHA-256 manifest；`eval_episodes.jsonl` 保存实际 clocks、位置/head/role、episode return/success/length 和 instance/reset seed。确定性评估直接取均值，并恢复训练 RNG。
 
@@ -246,51 +234,64 @@ DMC：
 
 R&D 的获取曲线来自 teacher、保留结果来自部署 student；P&C 的获取曲线来自 active column，旧任务保留来自 knowledge base，当前任务来自 active column。图例、manifest 和表注必须显式记录角色，不能拼成一个虚构 agent。
 
-## 7. 每个 run 必须保存的原始记录
+## 7. 后续完整机制实验的数据契约
 
-| 文件 | 最低内容 |
+下表是完整证据目标，不表示本次pilot已逐项产生所有文件。本次实际落盘以README为准：manifest/status、现有results/评估/Bellman记录、mechanism快照与窗口。训练逐episode provenance、后期独立reservoir、每次周期Clip的完整前后快照与细粒度资源JSONL尚未实现，不把汇总日志冒充这些记录。
+
+| 文件/对象 | 最低内容 |
 |---|---|
-| `run_manifest.json` | method、seed、任务顺序/位置、代码与依赖版本、完整参数、初始化 hash、实例/评估 seeds、预算、角色、状态 |
-| `eval_episodes.jsonl` | 全部时钟、训练/评估任务位置、occurrence/head/role、checkpoint、episode/instance/reset seed、return、success、length |
-| `train_episodes.jsonl` | 训练 episode 的任务、时钟、return、success、length |
-| `train_metrics.jsonl` | loss、alpha、reward/Q/target/TD 分布、梯度与更新范数、buffer size |
-| `boundary_events.jsonl` | 边界前后任务、模型/optimizer/alpha/replay/target 的实际处理、父 checkpoint |
-| `intervention_events.jsonl` | Clip/Reset 的触发时钟、原因、逐层奇异值、参数位移、Q-jump、target 同步和 optimizer 处理 |
-| `checkpoint_events.jsonl` | checkpoint ID、类型、任务位置、时钟、父状态、完整性 |
-| `resource_metrics.jsonl` | 训练/评估交互数、各类更新数、墙钟、峰值显存、参数与缓存大小 |
+| run_manifest.json | protocol ID、method、seed、任务/位置、parent和源码hash、网络/head/输入布局、完整参数、bank、状态 |
+| eval_episodes.jsonl | 全部时钟、训练/评估位置、occurrence/head/role、checkpoint、episode/instance/reset seed、return/success/length |
+| train_episodes.jsonl | 训练episode任务、时钟、return/success/length |
+| train_metrics.jsonl | 每1k环境步的loss、reward、α、speed、zero ratio及已有Q/target/TD分布 |
+| boundary_events.jsonl | 边界前后模型/optimizer/α/replay/target处理与父状态 |
+| intervention_events.jsonl | Clip/Reset前后权重谱、Q-jump、实际时钟、触发原因、optimizer/target处理 |
+| checkpoint_events.jsonl | 文件ID、完整/轻量类型、时钟、parent与完整性 |
+| resource_metrics.jsonl | 训练/评估/采集交互、各类更新、墙钟、显存与存储占用 |
 
-Anchors、target windows 和 checkpoints 按 `PAPER_OUTLINE_20260907.md` 第 6 节的 schema 保存。重型 Jacobian、谱分解和拟合在线关闭，训练后从固定输入、targets、模型和 optimizer 状态离线计算。
+### 7.1 快照与窗口
 
-## 8. 总预算与去重规则
+本次快照覆盖初始化/加载parent、任务切换前后、10k/50k/100k/500k/1M关键点与窗口端点；主SAC另存100k/边界/最终checkpoint。所有新任务止于1M，不生成1.5M/2M/3M训练点。周期Clip现有事件保存权重谱摘要和时钟，不声称保存每次事件前后完整critic。尚无B bank时只能保存模型，后续明确在B=10k anchors上离线评价，不冒充入口已知。
 
-| 部分 | 计划预算 |
+轻量快照至少含actor、online/target双Q、α、架构/head/输入映射、真实时钟与parent。用于carried-Adam分析的选定点另存双Q moments/step/lr/参数映射。完整可恢复状态需全部optimizer、RNG、env/sampler和必要replay；无法恢复的旧快照只标为analysis snapshot。
+
+方法专有状态仍保留：EWC的Fisher/参考参数；R&D的teacher/student；P&C的active/KB/previous-KB/adaptor/Fisher/compression optimizer；SpectralReg的power-iteration状态；ReDo的统计/mask/events；Clip的调度与已触发事件。不得因大纲精简删除实现所需数据。
+
+### 7.2 anchors、目标与频率
+
+本次每任务保留warm-up最早1024个probe transitions；动态panel固定取其中128个，保存obs/action/reward/next_obs/terminal，不包含可声称episode独立的provenance，也没有后期reservoir。独立episode panels/后期分布检验是后续数据契约要求。各方法独立probe不自动等于共同bank。
+
+日志频率：scalar/zero ratio1k；feature/weight/Hessian10k；Bellman100k；在线spectral保留10k/50k/100k/500k/1M，离线重建另计。E2评估50k，Hessian保留10k，不强行改成eval10k。本次main入口不额外产生step-0评估，AUC只积分真实记录区间，不捏造入口分数。E4保持其原10k eval及原固定spectral关键点。
+
+共同target流须记录target Q/actor/α来源、next-action随机量、实际minibatch与参数变化；不是各分支各自重采自己的targets。真实SAC无已知q*，不计算虚构全局价值误差。具体分析验收见写作框架§9。
+
+## 8. 总预算与去重
+
+| 部分 | 名义训练预算 |
 |---|---:|
-| 五条主序列 × 八方法 × 三 seeds | 1.44B 训练环境交互 |
-| 6×6 rethink：18 个源预训练 + 324 个目标分支 | 513M 训练环境交互 |
-| 合计名义配额 | 1.953B 训练环境交互 |
+| E4五条主序列×八方法×三seeds（不变） | 1.44B环境步 |
+| 当前E2 pilot：四组FT三seeds的A→B | 24M环境步 |
+| ABC seed1两条B→C补充 | 4M新环境步，含warm-up |
+| ABC seeds2/3：FT完整ABC＋同seed Q-reset的BC | 10M新环境步，A每seed只训练一次 |
+| 两批当前运行/排队合计 | 38M环境步（首批12M＋追加26M） |
+| 后续完整E2三seed方案：12A＋36B分支＋12fresh-B（未全部排队） | 60M环境步，包含兼容pilot份额 |
+| MAIN＋后续完整E2＋ABC名义总规模（不是本次队列） | 1.514B环境步 |
+| 已停止E1及旧历史实验 | 已发生的实际成本单列，不计为新的待跑配额 |
 
-以下内容不得重复计费或重复运行：
+取消旧6×6的513M配额及1.953B旧合计。E2不是六任务矩阵的子集缓存复用计划；不同预算/α/head/task bank不可默认复用。相同配置的R&D teacher去重规则仍按§6执行，名义和实际成本都报。
 
-- P1–P6 已属于完整 6×6 矩阵；
-- fresh 曲线复用六个源任务的独立训练；
-- 相同配置的 R&D teacher 可以缓存复用，但账本同时列名义成本和实际成本；
-- 评估交互、buffer 收集、蒸馏、meta updates、probe updates 和离线分析不计入训练交互，但分别报告实际成本。
+评估、额外rollout、蒸馏、P&C compression、诊断和离线重放分别记账；多列需求/多个窗口不计作额外在线实验个数。
 
-## 9. 明确不运行的旧方案
+## 9. 不运行的旧方案
 
-本轮不运行 H8、E8、CW20、ABC、RPP，不运行 actor-only、norm-only、随机扰动、from-A clip、阈值扫描、BRO、Muon 或额外无边界在线组，也不追加 ReDo 阈值/频率扫描或其他大规模 baseline/消融矩阵。
+不再运行6×6矩阵，不继续P1–P6，不重跑旧ABC seed1的A（新增seeds2/3的A需要各自训练），不启动RPP/H8/E8/CW20、actor-only/norm-only/随机扰动/from-A clip/BRO/Muon/PPO或大规模阈值扫描。ABC范围为seed1两条续跑及seeds2/3的FT/Q-reset；Clip-8不改写MAIN或E2的Clip-4。
 
-因此本轮不能据实验声称：critic 是唯一原因、第二任务起裁剪优于全程裁剪、当前阈值最优，或已经排除全部探索、范数与 optimizer 解释。
+不声称critic是唯一原因、默认阈值最优、第二任务起裁剪优于全程裁剪，或所有探索/optimizer替代解释已排除。
 
-## 10. E5：完成与发布检查
+## 10. E5：完成与发布
 
-一个正式 run 只有同时满足以下条件才标记为 completed：
+只有预算/任务位置/实际更新满足协议，评估和必要原始记录齐全，没有未知退出/NaN/覆盖，才能标completed。人为取消标cancelled说明，保留原始进程status；部分曲线不补零、不冒充完整预算。
 
-- 训练环境步、任务位置和更新计数满足固定预算；
-- 所有预定评估点和 50 episodes 均存在；
-- manifest、事件文件、必要 checkpoint 和资源记录完整；
-- 没有 NaN/Inf、未知退出码、被覆盖路径或方法角色混淆；
-- 可从原始记录重算 AUC、最终性能、配对差和图表输入；
-- 三 seeds 缺一时不填 0、不用其他 seed 替代，结果保持 incomplete。
+Figs.1–5与Tables1–3每个数可追溯到run/seed/checkpoint/role和分析协议。主图选择须有问题导向，全部四方向和三seeds保留；不删除不支持motivation的结果。
 
-发布到 GitHub 时只提交实验源码、测试、配置和本仓库的五份 Markdown。日志、模型、checkpoint、replay、anchors、JSONL、图、表格缓存及其他实验结果只保留在本地或独立制品存储中。
+GitHub只提交实验代码、测试、配置与作者Markdown；不再限制为旧“五份Markdown”，新写作框架也属于作者文档。日志、checkpoint、replay、anchors、结果JSONL、图表缓存和本地停机记录留在忽略目录。此次未push。

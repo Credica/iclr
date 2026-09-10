@@ -1,6 +1,6 @@
 # Motivation 与 Method 的联合理论：Bellman 需求、有限预算和干预代价
 
-2026-09-07，实验映射已按用户最新范围修订。配套 [PAPER_OUTLINE_20260907.md](PAPER_OUTLINE_20260907.md)：五条主序列、每个 RL 任务 1.5M 环境步、seeds 1/2/3；rethink 仅 FT/Reset/Clip（ours）。旧大规模方案仅作历史参考。下面保留假设、命题与证明；是研究草稿，不是已证明真实 SAC 全局收敛或已获得新的 RL 实验结果。Motivation 解释问题如何出现，Method 对同一个误差对象给出干预收益条件。
+2026-09-07，实验映射已按用户最新范围修订。配套 [PAPER_OUTLINE_20260907.md](PAPER_OUTLINE_20260907.md)：五条主序列维持每任务 1.5M 环境步、seeds 1/2/3；2026-09-10 新候选四组及 ABC 两条续跑统一 1M 实际环境步/新任务、DMC α=.01，四组FT已扩展到seeds1/2/3；ABC另追加FT/Q-reset seeds2/3，父A各自训练后共享给同seed分支。rethink 后续完整对照为 FT/Q-reset/Clip（ours）与 fresh。旧大规模方案仅作历史参考。下面保留假设、命题与证明；是研究草稿，不是已证明真实 SAC 全局收敛或已获得新的 RL 实验结果。Motivation 解释问题如何出现，Method 对同一个误差对象给出干预收益条件。
 
 ## 1. 统一研究对象与假设
 
@@ -262,6 +262,6 @@ anchor MSE下降不提供全域ε；SAC的动态α和连续动作还需额外条
 
 直接近邻：[Spectral Collapse](https://arxiv.org/html/2509.22335v3)已有快慢residual谱分析；[Supervision Complexity](https://arxiv.org/html/2301.12245v1)已有inverse-kernel需求量；[SingularClip](https://arxiv.org/html/2608.18319v1)提供当前裁剪算子及其理论；soft-control背景见[SAC](https://arxiv.org/abs/1801.01290)。式(10)是此处在明确假设下推导的辅助界，不冒充该SAC论文的逐字定理。
 
-当前状态：上述恒等式、界和构造沿用此前的独立代数审查；真实 SAC 中的条件是否满足仍待新骨架的三方法机制实验。本次仅同步文档、范围与实验映射，未修改方法实现或启动训练。论文的场景增量定位为 Bellman 传播下的有限预算适应、继承 Q/K 的作用分离和干预—适应证据，不以重命名已有裁剪算子制造新颖性。tech-paper-template 用于使两条理论链与当前可执行范围对应。
+当前状态：上述恒等式、界和构造沿用此前的独立代数审查；真实 SAC 中的条件是否满足仍待新骨架的三方法机制实验。本理论文件只同步范围，不将本次在线启动当作理论已被验证；训练执行与状态以 README/新 manifest 为准。论文的场景增量定位为 Bellman 传播下的有限预算适应、继承 Q/K 的作用分离和干预—适应证据，不以重命名已有裁剪算子制造新颖性。tech-paper-template 用于使两条理论链与当前可执行范围对应。
 
 数值核验：20组随机两层模型的Jacobian Gram和实际clip函数变化均符合S2；60组有限H干预收益恒等式的最大绝对误差为2.84e-14。联合谱上下界、两状态相反迁移符号构造、零函数冲击且严格加速的构造均通过检查。这些检查验证代数实现，不替代证明或RL实验。

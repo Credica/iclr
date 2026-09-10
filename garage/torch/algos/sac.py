@@ -653,10 +653,12 @@ class SAC(RLAlgorithm):
             if 'policy_optimizer' in checkpoint:
                 self._policy_optimizer.load_state_dict(
                     checkpoint['policy_optimizer'])
-            if 'qf1_optimizer' in checkpoint:
+            # A task-boundary fresh critic must not inherit the old Adam moments.
+            restore_critic_optimizer = (branch_task_step > 0 or online_source != 'fresh')
+            if restore_critic_optimizer and 'qf1_optimizer' in checkpoint:
                 self._qf1_optimizer.load_state_dict(
                     checkpoint['qf1_optimizer'])
-            if 'qf2_optimizer' in checkpoint:
+            if restore_critic_optimizer and 'qf2_optimizer' in checkpoint:
                 self._qf2_optimizer.load_state_dict(
                     checkpoint['qf2_optimizer'])
 

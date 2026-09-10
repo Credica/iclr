@@ -2,7 +2,9 @@
 # Local Clip queue, independent of the two friends' baseline queues.
 set -euo pipefail
 if (($# < 3)); then
-    echo "Usage: $0 ARTIFACT_ROOT GPU_IDS (--prepare-only|--run) [--singular_clip_min LOWER] [--singular_clip_max UPPER]" >&2
+    echo "Usage: $0 ARTIFACT_ROOT GPU_IDS (--prepare-only|--run) [generate_clip_matrix.py options]" >&2
+    echo "Options include --singular_clip_mode, --singular_clip_schedule, --singular_clip_interval," >&2
+    echo "--singular_clip_min, --singular_clip_max, --sequences and --seeds." >&2
     exit 2
 fi
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
